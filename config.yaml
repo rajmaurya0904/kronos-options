@@ -6,7 +6,7 @@
 # ── Instruments ────────────────────────────────────────────────────────
 instruments:
   NIFTY:
-    upstox_key: "NSE_INDEX|Nifty 50"
+    upstox_key: "NSE_INDEX|Nifty 50"   # kept for reference; not used with Zerodha
     zerodha_symbol: "NIFTY 50"
     atm_step: 50            # Strike rounding granularity
     lot_size: 75            # Current lot size — verified 2026; fetch_lot_size: true to override
@@ -15,7 +15,7 @@ instruments:
     enabled: true
 
   BANKNIFTY:
-    upstox_key: "NSE_INDEX|Nifty Bank"
+    upstox_key: "NSE_INDEX|Nifty Bank"  # kept for reference; not used with Zerodha
     zerodha_symbol: "NIFTY BANK"
     atm_step: 100
     lot_size: 15
@@ -24,7 +24,7 @@ instruments:
     enabled: true
 
   SENSEX:
-    upstox_key: "BSE_INDEX|SENSEX"
+    upstox_key: "BSE_INDEX|SENSEX"      # kept for reference; not used with Zerodha
     zerodha_symbol: "SENSEX"
     atm_step: 100
     lot_size: 10
@@ -35,8 +35,8 @@ instruments:
 
 # ── Broker ─────────────────────────────────────────────────────────────
 broker:
-  primary: "upstox"          # "upstox" | "zerodha"
-  base_url: "https://api.upstox.com/v2"
+  primary: "zerodha"         # "zerodha" | "upstox"
+  base_url: "https://api.kite.trade"
   request_delay_s: 0.35      # Polite rate-limiting between API calls
   timeout_s: 10
   max_retries: 3
@@ -109,9 +109,9 @@ event_calendar:
   "2026-06-09": "RBI MPC Policy"
   "2026-01-01": "New Year Holiday"
 
-# ── Transaction Costs (Zerodha / Upstox rate card, June 2026) ──────────
+# ── Transaction Costs (Zerodha rate card, June 2026) ───────────────────
 costs:
-  brokerage_per_order: 20.0         # ₹20 flat per executed order
+  brokerage_per_order: 20.0         # ₹20 flat per executed order (Zerodha)
   stt_sell_options_pct: 0.05        # STT 0.05% on sell-side premium (options)
   exchange_txn_options_pct: 0.053   # NSE/BSE exchange transaction charge
   gst_pct: 18.0                     # GST on (brokerage + exchange fees)
@@ -152,9 +152,8 @@ logging:
 
 # ── Backtester ─────────────────────────────────────────────────────────
 backtest:
-  # IMPORTANT: Uses Upstox expired-instruments API for real option OHLC data.
-  # This is actual historical option prices — NOT Black-Scholes approximation.
-  # Black-Scholes fallback is available when API data is missing.
+  # Uses Zerodha Kite Connect historical API for real option OHLC data.
+  # Black-Scholes fallback available when API data is missing.
   use_real_option_data: true
   bs_fallback_when_missing: true
   iv_assumption_pct: 15.0    # Used ONLY for Black-Scholes fallback

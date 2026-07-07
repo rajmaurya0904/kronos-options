@@ -6,7 +6,7 @@ Swap brokers by changing broker.primary in config.yaml.
 from __future__ import annotations
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import Optional
+from typing import Optional, List
 
 
 class BrokerInterface(ABC):
@@ -65,6 +65,21 @@ class BrokerInterface(ABC):
         """Return latest quote dict with keys: ltp, open, high, low, close, volume."""
         ...
 
+    def get_ltp(self, instrument_keys: List[str]) -> dict:
+        """
+        Return {instrument_key: ltp} for each key in the list.
+        Default implementation calls get_live_quote() per key.
+        Concrete brokers may override for a batched API call.
+        """
+        result = {}
+        for key in instrument_keys:
+            try:
+                q = self.get_live_quote(key)
+                result[key] = float(q.get("ltp", 0.0))
+            except Exception:
+                result[key] = 0.0
+        return result
+
     # ── Order management (paper trader uses these as no-ops or logs) ───
 
     @abstractmethod
@@ -88,4 +103,9 @@ class BrokerInterface(ABC):
     @abstractmethod
     def get_order_status(self, order_id: str) -> dict:
         """Return order status dict."""
+        ...
+
+    @abstractmethod
+    def get_available_margin(self) -> float:
+        """Return available cash margin for F&O segment (in ₹)."""
         ...

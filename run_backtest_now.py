@@ -1,4 +1,4 @@
-"""Quick backtest runner — NIFTY May-June 2026 with real Upstox data."""
+"""Quick backtest runner — NIFTY May-June 2026 with real Zerodha/Kite data."""
 import logging
 import warnings
 warnings.filterwarnings("ignore")

@@ -31,6 +31,31 @@ from src.utils import load_config, IST
 
 logger = logging.getLogger(__name__)
 
+# ── Pre-flight torch check (emit ONE warning at import time, never per-bar) ──
+_TORCH_AVAILABLE = False
+_TORCH_WARN_EMITTED = False
+
+try:
+    import torch  # noqa: F401
+    _TORCH_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _warn_torch_once() -> None:
+    """Emit the torch-missing warning exactly once per process."""
+    global _TORCH_WARN_EMITTED
+    if not _TORCH_WARN_EMITTED:
+        logger.warning(
+            "PyTorch not found — Kronos AI forecasting is DISABLED. "
+            "Backtester will fall back to Black-Scholes signals.\n"
+            "  Fix: pip install torch torchvision torchaudio "
+            "--index-url https://download.pytorch.org/whl/cpu\n"
+            "  Then:  cd '%s' && pip install -r requirements.txt",
+            os.environ.get("KRONOS_REPO_PATH", "<KRONOS_REPO_PATH>"),
+        )
+        _TORCH_WARN_EMITTED = True
+
 
 class KronosForecaster:
     """
@@ -39,6 +64,10 @@ class KronosForecaster:
     Calls predict() `samples` times with temperature sampling to build a
     distribution of future paths. Each call is stochastic (T=1.0, top_p<1).
     Model is loaded lazily on first forecast call.
+
+    If PyTorch is unavailable the forecaster raises RuntimeError on the first
+    call to forecast(), which the backtester catches and handles via its
+    Black-Scholes fallback — no per-bar log spam.
     """
 
     def __init__(self, config_path: str = "config.yaml", db_path: str = "data/kronos_options.db"):
@@ -48,6 +77,7 @@ class KronosForecaster:
         self.cfg = load_config(config_path)
         self.db_path = db_path
         self._predictor = None
+        self._unavailable = False  # set True after first load failure to skip retries
         init_db(db_path)
 
         kcfg = self.cfg.get("kronos", {})
@@ -67,9 +97,22 @@ class KronosForecaster:
         """Load Kronos-small + Tokenizer. Called once on first forecast."""
         if self._predictor is not None:
             return
+        if self._unavailable:
+            raise RuntimeError("Kronos unavailable (previous load failed — see earlier warning).")
 
-        logger.info("Loading Kronos-small from %s (first call — downloads models from HuggingFace)…",
-                    self.kronos_path)
+        # Gate on torch before attempting any imports
+        if not _TORCH_AVAILABLE:
+            _warn_torch_once()
+            self._unavailable = True
+            raise RuntimeError(
+                "PyTorch not installed. Install with:\n"
+                "  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu"
+            )
+
+        logger.info(
+            "Loading Kronos-small from %s (first call — downloads models from HuggingFace)…",
+            self.kronos_path,
+        )
 
         if self.kronos_path not in sys.path:
             sys.path.insert(0, self.kronos_path)
@@ -77,6 +120,7 @@ class KronosForecaster:
         try:
             from model import Kronos, KronosTokenizer, KronosPredictor  # type: ignore[import]
         except ImportError as e:
+            self._unavailable = True
             raise ImportError(
                 f"Cannot import Kronos from {self.kronos_path}.\n"
                 f"Run: cd {self.kronos_path} && pip install -r requirements.txt\n"
@@ -147,7 +191,7 @@ class KronosForecaster:
                 logger.debug("Cache hit for %s (hash %s…)", symbol, input_hash[:8])
                 return self._deserialise_cached(cached, current_close)
 
-        self._load_model()
+        self._load_model()  # raises RuntimeError if torch/Kronos unavailable
 
         sample_paths = self._run_kronos(input_df, pred_len, samples)
 
@@ -207,7 +251,7 @@ class KronosForecaster:
 
         Returns np.ndarray of shape (samples, pred_len) — close price paths.
         """
-        kcfg       = self.cfg.get("kronos", {})
+        kcfg        = self.cfg.get("kronos", {})
         temperature = kcfg.get("temperature", 1.0)
         top_p       = kcfg.get("top_p", 0.9)
 

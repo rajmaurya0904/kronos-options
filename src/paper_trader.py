@@ -28,7 +28,7 @@ from src.data_cleaner import clean, is_expiry_day
 from src.forecaster import KronosForecaster
 from src.signal_engine import SignalEngine
 from src.options_mapper import OptionsMapper
-from src.utils import get_broker, load_config, now_ist, is_market_open, IST
+from src.utils import get_broker, get_instrument_key, load_config, now_ist, is_market_open, IST
 from src.db import init_db, save_signal, get_conn, get_paper_trades
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ class PaperTrader:
         self.broker    = broker
         self.symbols   = symbols
         self.cfg       = load_config(config_path)
+        self.config_path = config_path
         self.db_path   = db_path
         self.fetcher   = DataFetcher(broker, config_path)
         self.forecaster = KronosForecaster(config_path, db_path)
@@ -91,7 +92,6 @@ class PaperTrader:
             except Exception as e:
                 logger.error("Tick error: %s", e, exc_info=True)
 
-            # Sleep until next 5-min bar boundary
             seconds_past = now.minute % 5 * 60 + now.second
             sleep_for = max(5, 300 - seconds_past)
             logger.debug("Sleeping %ds until next bar.", sleep_for)
@@ -104,19 +104,16 @@ class PaperTrader:
         no_trade_until = dtime(9, 15 + self.no_trade_open)
         sq_off_time    = dtime(self.sq_off_h, self.sq_off_m)
 
-        # Square off all positions
         if t >= sq_off_time:
             self._square_off_all(now)
             return
 
-        # Mark open positions to market
         self._mark_to_market(now)
 
         if t < no_trade_until:
             logger.debug("Waiting for market to settle (before %s).", no_trade_until)
             return
 
-        # Process each symbol
         open_count = len(self._open_positions)
         for symbol in self.symbols:
             if open_count >= self.max_open:
@@ -148,8 +145,7 @@ class PaperTrader:
                 logger.info("%s: NEUTRAL — no trade.", symbol)
                 return
 
-            # Get nearest weekly expiry
-            inst_key = self.cfg["instruments"][symbol]["upstox_key"]
+            inst_key = get_instrument_key(symbol, self.config_path)
             expiries = self.broker.get_expired_expiries(inst_key)
             today_str = now.strftime("%Y-%m-%d")
             valid = [e for e in expiries if e >= today_str]
@@ -158,7 +154,6 @@ class PaperTrader:
                 return
             expiry = sorted(valid)[0]
 
-            # Get live option chain
             try:
                 chain = self.broker.get_option_chain(inst_key, expiry)
             except Exception:
@@ -195,7 +190,6 @@ class PaperTrader:
         }
         self._open_positions[symbol] = trade
 
-        # Persist to DB
         legs_json = json.dumps(rec.get("legs", []))
         with get_conn(self.db_path) as conn:
             conn.execute(
@@ -206,7 +200,7 @@ class PaperTrader:
             )
 
         msg = (f"{rec['strategy']} | confidence={signal['confidence']:.2f} | "
-               f"max_loss=₹{rec.get('max_loss_rs', 0):.0f}")
+               f"max_loss=\u20b9{rec.get('max_loss_rs', 0):.0f}")
         logger.info("PAPER TRADE OPEN: %s %s", symbol, msg)
         notify(f"New Signal: {symbol}", msg)
 
@@ -223,7 +217,7 @@ class PaperTrader:
         if not pos:
             return
 
-        inst_key = self.cfg["instruments"][symbol]["upstox_key"]
+        inst_key = get_instrument_key(symbol, self.config_path)
         lot_size = self.cfg["instruments"][symbol]["lot_size"]
         lots     = pos.get("lots", 1)
         legs     = pos.get("legs", [])
@@ -232,10 +226,10 @@ class PaperTrader:
         exit_premium = self._fetch_legs_premium(symbol, inst_key, legs, pos["expiry"])
 
         raw_pnl = (exit_premium - pos["entry_premium"]) * lot_size * lots * n_legs
-        charges = 20.0 * 2 * n_legs  # flat ₹20/order, entry + exit per leg
+        charges = 20.0 * 2 * n_legs
         net_pnl = raw_pnl - charges
 
-        logger.info("PAPER TRADE CLOSE: %s %s | exit_prem=%.2f | net_pnl=₹%.0f | reason=%s",
+        logger.info("PAPER TRADE CLOSE: %s %s | exit_prem=%.2f | net_pnl=\u20b9%.0f | reason=%s",
                     symbol, pos["strategy"], exit_premium, net_pnl, reason)
 
         with get_conn(self.db_path) as conn:
@@ -268,7 +262,7 @@ class PaperTrader:
         net = 0.0
         for leg in legs:
             col = f"{leg['option_type']}_ltp"
-            ltp = leg.get("ltp", 0.0)  # fallback to entry price
+            ltp = leg.get("ltp", 0.0)
             if not chain.empty:
                 row = chain[chain["strike"] == leg["strike"]]
                 if not row.empty and col in row.columns:
@@ -282,7 +276,7 @@ class PaperTrader:
         """Log current unrealised P&L for all open positions."""
         for symbol, pos in self._open_positions.items():
             try:
-                inst_key = self.cfg["instruments"][symbol]["upstox_key"]
+                inst_key = get_instrument_key(symbol, self.config_path)
                 lot_size = self.cfg["instruments"][symbol]["lot_size"]
                 lots     = pos.get("lots", 1)
                 legs     = pos.get("legs", [])
@@ -290,7 +284,7 @@ class PaperTrader:
                     symbol, inst_key, legs, pos["expiry"]
                 )
                 unrealised = (current_premium - pos["entry_premium"]) * lot_size * lots * len(legs)
-                logger.info("MTM %s %s: unrealised P&L = ₹%.0f", symbol, pos["strategy"], unrealised)
+                logger.info("MTM %s %s: unrealised P&L = \u20b9%.0f", symbol, pos["strategy"], unrealised)
             except Exception as e:
                 logger.debug("MTM failed for %s: %s", symbol, e)
 

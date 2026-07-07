@@ -23,7 +23,7 @@ from typing import Optional
 import pandas as pd
 
 from src.broker.base import BrokerInterface
-from src.utils import IST, is_trading_day, load_config
+from src.utils import IST, is_trading_day, load_config, get_instrument_key
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +34,12 @@ class DataFetcher:
     def __init__(self, broker: BrokerInterface, config_path: str = "config.yaml"):
         self.broker = broker
         self.cfg = load_config(config_path)
+        self.config_path = config_path
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _instrument_key(self, symbol: str) -> str:
-        return self.cfg["instruments"][symbol]["upstox_key"]
+        """Return instrument key for the active broker (Upstox or Zerodha)."""
+        return get_instrument_key(symbol, self.config_path)
 
     def _cache_path(self, symbol: str, resolution: str) -> Path:
         return CACHE_DIR / f"{symbol}_{resolution}.csv"
@@ -157,7 +159,6 @@ class DataFetcher:
         Fetch the most recent n_bars for use in forecasting.
         Combines cached history with today's live bars.
         """
-        # Load all cached data
         cache_path = self._cache_path(symbol, resolution)
         if cache_path.exists():
             df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
@@ -165,7 +166,6 @@ class DataFetcher:
         else:
             df = pd.DataFrame()
 
-        # Fetch today's data and append
         today = date.today().strftime("%Y-%m-%d")
         today_df = self._fetch_one_day(symbol, today, resolution)
         if today_df is not None and not today_df.empty:
@@ -193,7 +193,6 @@ class DataFetcher:
         """
         instrument_key = self._instrument_key(symbol)
 
-        # Find nearest expiry on or after date_str if not provided
         if expiry is None:
             expiries = self.broker.get_expired_expiries(instrument_key)
             valid = [e for e in expiries if e >= date_str]
@@ -202,11 +201,9 @@ class DataFetcher:
                 return None
             expiry = sorted(valid)[0]
 
-        # Get option instrument key
         opt_key = self.broker.get_expired_option_key(instrument_key, expiry, strike, option_type)
 
         if opt_key is None:
-            # Try adjacent strikes
             atm_step = self.cfg["instruments"][symbol]["atm_step"]
             for adj in [atm_step, -atm_step, atm_step * 2, -atm_step * 2]:
                 opt_key = self.broker.get_expired_option_key(
@@ -220,7 +217,6 @@ class DataFetcher:
         if opt_key is None:
             return None
 
-        # Fetch 1-min candles for the day and pick the requested time
         candles = self.broker.get_expired_option_candles(opt_key, "1minute", date_str)
         for c in candles:
             if time_str in str(c[0]):

@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kronos Options — Profit Chart</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300..700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ── TOKENS ──────────────────────────────── */
+    :root,[data-theme=light]{
+      --bg:       #f7f6f2;
+      --surface:  #ffffff;
+      --surface2: #f3f0ec;
+      --border:   rgba(0,0,0,0.09);
+      --text:     #1a1917;
+      --muted:    #7a7974;
+      --faint:    #bab9b4;
+      --profit:   #01696f;
+      --loss:     #a13544;
+      --drawdown: #964219;
+      --accent:   #01696f;
+      --gold:     #d19900;
+      --mono:     'DM Mono', monospace;
+      --font:     'DM Sans', sans-serif;
+      --radius:   10px;
+      --shadow:   0 2px 16px rgba(0,0,0,0.07);
+    }
+    [data-theme=dark]{
+      --bg:       #0f0e0d;
+      --surface:  #171614;
+      --surface2: #1e1d1b;
+      --border:   rgba(255,255,255,0.07);
+      --text:     #e0dfd9;
+      --muted:    #7a7974;
+      --faint:    #3d3c3a;
+      --profit:   #4f98a3;
+      --loss:     #dd6974;
+      --drawdown: #fdab43;
+      --accent:   #4f98a3;
+      --gold:     #e8af34;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
+    body{
+      font-family:var(--font);
+      background:var(--bg);
+      color:var(--text);
+      min-height:100dvh;
+      font-size:15px;
+    }
+    /* ── LAYOUT ── */
+    .app{display:flex;flex-direction:column;min-height:100dvh}
+    header{
+      display:flex;align-items:center;justify-content:space-between;
+      padding:14px 24px;
+      background:var(--surface);
+      border-bottom:1px solid var(--border);
+      position:sticky;top:0;z-index:100;
+    }
+    .logo{display:flex;align-items:center;gap:10px;font-weight:600;font-size:15px;letter-spacing:-0.01em}
+    .logo svg{flex-shrink:0}
+    .header-right{display:flex;align-items:center;gap:12px}
+    .badge{font-size:11px;font-family:var(--mono);padding:3px 8px;border-radius:4px;
+           background:var(--surface2);color:var(--muted);border:1px solid var(--border)}
+    .theme-btn{background:none;border:1px solid var(--border);border-radius:8px;
+               padding:6px 10px;cursor:pointer;color:var(--muted);font-size:13px;
+               transition:all 180ms ease}
+    .theme-btn:hover{color:var(--text);border-color:var(--accent)}
+    main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
+    /* ── KPI ROW ── */
+    .kpi-grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fill,minmax(160px,1fr));
+      gap:12px;margin-bottom:24px;
+    }
+    .kpi{
+      background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--radius);padding:16px 18px;
+      box-shadow:var(--shadow);
+    }
+    .kpi-label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
+    .kpi-value{font-size:22px;font-weight:600;font-family:var(--mono);line-height:1.15;letter-spacing:-.02em}
+    .kpi-value.pos{color:var(--profit)}
+    .kpi-value.neg{color:var(--loss)}
+    .kpi-value.neutral{color:var(--text)}
+    .kpi-sub{font-size:11px;color:var(--muted);margin-top:4px;font-family:var(--mono)}
+    /* ── CHART CARDS ── */
+    .charts-grid{
+      display:grid;
+      grid-template-columns:1fr 1fr;
+      gap:16px;
+    }
+    .chart-card{
+      background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--radius);padding:20px;
+      box-shadow:var(--shadow);
+    }
+    .chart-card.full{grid-column:1/-1}
+    .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+    .card-title{font-weight:600;font-size:13px;letter-spacing:-.01em}
+    .card-sub{font-size:11px;color:var(--muted)}
+    .chart-wrap{position:relative;width:100%}
+    .chart-wrap canvas{display:block;width:100%!important}
+    /* ── FILTER BAR ── */
+    .filter-bar{
+      display:flex;gap:8px;align-items:center;
+      margin-bottom:20px;flex-wrap:wrap;
+    }
+    .filter-label{font-size:12px;color:var(--muted)}
+    .btn-group{display:flex;gap:4px}
+    .btn-filter{
+      background:var(--surface2);border:1px solid var(--border);
+      border-radius:6px;padding:5px 12px;
+      cursor:pointer;font-size:12px;color:var(--muted);
+      transition:all 150ms ease;font-family:var(--font);
+    }
+    .btn-filter:hover{color:var(--text)}
+    .btn-filter.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+    /* ── TABLE ── */
+    .table-wrap{overflow-x:auto;margin-top:12px}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th{text-align:left;padding:8px 12px;font-size:10px;text-transform:uppercase;
+       letter-spacing:.06em;color:var(--muted);border-bottom:1px solid var(--border)}
+    td{padding:8px 12px;border-bottom:1px solid var(--border);font-family:var(--mono)}
+    td.pos{color:var(--profit)}
+    td.neg{color:var(--loss)}
+    tr:hover td{background:var(--surface2)}
+    /* ── EMPTY STATE ── */
+    .empty-state{
+      display:flex;flex-direction:column;align-items:center;
+      justify-content:center;padding:80px 24px;text-align:center;
+      color:var(--muted);
+    }
+    .empty-icon{font-size:40px;margin-bottom:16px;opacity:.4}
+    .empty-state h3{color:var(--text);margin-bottom:8px;font-size:16px}
+    .empty-state p{font-size:13px;max-width:40ch;line-height:1.6}
+    .empty-state code{font-family:var(--mono);background:var(--surface2);
+                       padding:2px 6px;border-radius:4px;color:var(--accent)}
+    /* ── RESPONSIVE ── */
+    @media(max-width:768px){
+      main{padding:16px}
+      .charts-grid{grid-template-columns:1fr}
+      .chart-card.full{grid-column:1}
+      .kpi-grid{grid-template-columns:repeat(2,1fr)}
+    }
+    /* ── LOADING ── */
+    #loading{position:fixed;inset:0;background:var(--bg);display:flex;
+              align-items:center;justify-content:center;z-index:999;
+              font-size:13px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase}
+    .spin{width:20px;height:20px;border:2px solid var(--border);
+           border-top-color:var(--accent);border-radius:50%;
+           animation:spin 700ms linear infinite;margin-right:12px}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+<div id="loading"><div class="spin"></div>Loading chart…</div>
+
+<div class="app">
+  <!-- HEADER -->
+  <header>
+    <div class="logo">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-label="Kronos Options logo">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5" opacity=".3"/>
+        <path d="M12 4 L12 12 L18 8" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="12" cy="12" r="2" fill="var(--accent)"/>
+        <path d="M5 17 Q12 10 19 17" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 2" opacity=".4" fill="none"/>
+      </svg>
+      Kronos Options
+    </div>
+    <div class="header-right">
+      <span class="badge" id="data-badge">No data</span>
+      <button class="theme-btn" onclick="toggleTheme()" title="Toggle dark/light">&#9680;</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- FILTER BAR -->
+    <div class="filter-bar">
+      <span class="filter-label">Period:</span>
+      <div class="btn-group" id="period-btns">
+        <button class="btn-filter" onclick="setPeriod(90)">3M</button>
+        <button class="btn-filter" onclick="setPeriod(180)">6M</button>
+        <button class="btn-filter" onclick="setPeriod(365)">1Y</button>
+        <button class="btn-filter active" onclick="setPeriod(730)">2Y</button>
+        <button class="btn-filter" onclick="setPeriod(0)">All</button>
+      </div>
+      <span class="filter-label" style="margin-left:12px">Source:</span>
+      <div class="btn-group" id="source-btns">
+        <button class="btn-filter active" onclick="setSource('all')">All</button>
+        <button class="btn-filter" onclick="setSource('paper')">Paper</button>
+        <button class="btn-filter" onclick="setSource('backtest')">Backtest</button>
+      </div>
+      <span class="filter-label" style="margin-left:auto;font-family:var(--mono)" id="last-updated"></span>
+    </div>
+
+    <!-- KPI ROW -->
+    <div class="kpi-grid" id="kpi-grid"></div>
+
+    <!-- CHARTS -->
+    <div class="charts-grid">
+      <!-- Cumulative P&L -->
+      <div class="chart-card full">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Cumulative Net P&amp;L</div>
+            <div class="card-sub">All closed trades, net of charges</div>
+          </div>
+        </div>
+        <div class="chart-wrap" style="height:280px">
+          <canvas id="chart-cumulative"></canvas>
+        </div>
+      </div>
+
+      <!-- Daily P&L -->
+      <div class="chart-card">
+        <div class="card-header">
+          <div class="card-title">Daily P&amp;L</div>
+          <div class="card-sub">Net per trading day</div>
+        </div>
+        <div class="chart-wrap" style="height:220px">
+          <canvas id="chart-daily"></canvas>
+        </div>
+      </div>
+
+      <!-- Drawdown -->
+      <div class="chart-card">
+        <div class="card-header">
+          <div class="card-title">Drawdown</div>
+          <div class="card-sub">From peak equity</div>
+        </div>
+        <div class="chart-wrap" style="height:220px">
+          <canvas id="chart-drawdown"></canvas>
+        </div>
+      </div>
+
+      <!-- Monthly P&L -->
+      <div class="chart-card">
+        <div class="card-header">
+          <div class="card-title">Monthly P&amp;L</div>
+          <div class="card-sub">Net per calendar month</div>
+        </div>
+        <div class="chart-wrap" style="height:220px">
+          <canvas id="chart-monthly"></canvas>
+        </div>
+      </div>
+
+      <!-- By Strategy -->
+      <div class="chart-card">
+        <div class="card-header">
+          <div class="card-title">P&amp;L by Strategy</div>
+          <div class="card-sub">Cumulative net per strategy</div>
+        </div>
+        <div class="chart-wrap" style="height:220px">
+          <canvas id="chart-strategy"></canvas>
+        </div>
+      </div>
+
+      <!-- Trades table -->
+      <div class="chart-card full">
+        <div class="card-header">
+          <div class="card-title">Recent Trades</div>
+          <div class="card-sub">Last 50 closed trades</div>
+        </div>
+        <div class="table-wrap" id="trades-table-wrap"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+// ── STATE ─────────────────────────────────────────────────────────
+let DATA = null;
+let CHARTS = {};
+let PERIOD_DAYS = 730;
+let ACTIVE_SOURCE = 'all';
+
+// ── THEME ─────────────────────────────────────────────────────────
+function toggleTheme() {
+  const html = document.documentElement;
+  const cur = html.getAttribute('data-theme');
+  html.setAttribute('data-theme', cur === 'dark' ? 'light' : 'dark');
+  if (DATA) renderAll();
+}
+
+// ── CSS VARS ──────────────────────────────────────────────────────
+function cv(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// ── LOAD DATA ──────────────────────────────────────────────────────
+async function loadData() {
+  try {
+    const resp = await fetch('./chart_data.json');
+    if (!resp.ok) throw new Error('chart_data.json not found');
+    DATA = await resp.json();
+    document.getElementById('loading').style.display = 'none';
+    const gen = new Date(DATA.generated_at);
+    document.getElementById('last-updated').textContent =
+      'Updated ' + gen.toLocaleDateString('en-IN', {day:'numeric',month:'short',year:'numeric'});
+    document.getElementById('data-badge').textContent =
+      (DATA.series.all.stats.total_trades || 0) + ' trades';
+    renderAll();
+  } catch(e) {
+    document.getElementById('loading').style.display = 'none';
+    showEmpty();
+  }
+}
+
+function showEmpty() {
+  document.querySelector('main').innerHTML = `
+    <div class="empty-state">
+      <div class="empty-icon">📈</div>
+      <h3>No chart data yet</h3>
+      <p>Run the exporter to generate data from your DB:</p>
+      <p style="margin-top:12px">
+        <code>python -m src.chart_exporter --source paper</code>
+      </p>
+      <p style="margin-top:8px;font-size:12px">
+        This writes <code>dashboard/chart_data.json</code> which this chart reads.
+      </p>
+    </div>
+  `;
+}
+
+// ── FILTER HELPERS ────────────────────────────────────────────────
+function setPeriod(days) {
+  PERIOD_DAYS = days;
+  document.querySelectorAll('#period-btns .btn-filter').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  if (DATA) renderAll();
+}
+
+function setSource(src) {
+  ACTIVE_SOURCE = src;
+  document.querySelectorAll('#source-btns .btn-filter').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  if (DATA) renderAll();
+}
+
+function getActiveSeries() {
+  const s = DATA.series;
+  if (ACTIVE_SOURCE !== 'all' && s[ACTIVE_SOURCE]) return s[ACTIVE_SOURCE];
+  return s.all;
+}
+
+function filterByPeriod(dates, values) {
+  if (!PERIOD_DAYS) return {dates, values};
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - PERIOD_DAYS);
+  const cutStr = cutoff.toISOString().slice(0, 10);
+  const filtered = dates.map((d, i) => ({d, v: values[i]})).filter(x => x.d >= cutStr);
+  return {
+    dates:  filtered.map(x => x.d),
+    values: filtered.map(x => x.v),
+  };
+}
+
+// ── KPI ─────────────────────────────────────────────────────────────
+function renderKPIs(stats) {
+  const fmt = (n) => new Intl.NumberFormat('en-IN', {maximumFractionDigits:0}).format(n);
+  const kpis = [
+    {label:'Net P&L', value: '₹' + fmt(stats.total_pnl),
+     cls: stats.total_pnl >= 0 ? 'pos' : 'neg',
+     sub: stats.total_trades + ' trades'},
+    {label:'Win Rate', value: stats.win_rate_pct + '%',
+     cls: stats.win_rate_pct >= 50 ? 'pos' : 'neg',
+     sub: stats.wins + 'W / ' + stats.losses + 'L'},
+    {label:'Profit Factor', value: stats.profit_factor,
+     cls: stats.profit_factor >= 1 ? 'pos' : 'neg',
+     sub: 'Avg win / avg loss'},
+    {label:'Max Drawdown', value: '₹' + fmt(stats.max_drawdown_rs),
+     cls: 'neg',
+     sub: 'From peak equity'},
+    {label:'Best Day', value: '₹' + fmt(stats.best_day_rs),
+     cls: 'pos',
+     sub: 'Single day'},
+    {label:'Worst Day', value: '₹' + fmt(stats.worst_day_rs),
+     cls: 'neg',
+     sub: 'Single day'},
+    {label:'Avg Win', value: '₹' + fmt(stats.avg_win_rs),
+     cls: 'pos',
+     sub: ''},
+    {label:'Avg Loss', value: '₹' + fmt(stats.avg_loss_rs),
+     cls: 'neg',
+     sub: ''},
+  ];
+  document.getElementById('kpi-grid').innerHTML = kpis.map(k => `
+    <div class="kpi">
+      <div class="kpi-label">${k.label}</div>
+      <div class="kpi-value ${k.cls}">${k.value}</div>
+      ${k.sub ? `<div class="kpi-sub">${k.sub}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+// ── CHART DEFAULTS ─────────────────────────────────────────────────
+function baseChartOptions(tickColor) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: {duration: 500, easing: 'easeOutQuart'},
+    plugins: {
+      legend: {display: false},
+      tooltip: {
+        backgroundColor: cv('--surface'),
+        borderColor: cv('--border'),
+        borderWidth: 1,
+        titleColor: cv('--muted'),
+        bodyColor: cv('--text'),
+        padding: 10,
+        titleFont: {family: cv('--font'), size: 11},
+        bodyFont: {family: cv('--mono'), size: 12},
+        callbacks: {
+          label: ctx => ' ₹' + new Intl.NumberFormat('en-IN').format(Math.round(ctx.raw)),
+        }
+      },
+    },
+    scales: {
+      x: {
+        ticks: {color: cv('--muted'), font:{size:10, family: cv('--font')}, maxRotation:0, maxTicksLimit:8},
+        grid: {color: cv('--border')},
+        border: {color: cv('--border')},
+      },
+      y: {
+        ticks: {
+          color: cv('--muted'),
+          font: {size:10, family: cv('--mono')},
+          callback: v => '₹' + (Math.abs(v) >= 1000 ? Math.round(v/1000) + 'k' : Math.round(v)),
+        },
+        grid: {color: cv('--border')},
+        border: {color: cv('--border')},
+      },
+    },
+  };
+}
+
+function makeOrUpdate(id, type, data, options) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (CHARTS[id]) {
+    CHARTS[id].destroy();
+  }
+  CHARTS[id] = new Chart(canvas.getContext('2d'), {type, data, options});
+}
+
+// ── RENDER ALL ─────────────────────────────────────────────────────────
+function renderAll() {
+  if (!DATA) return;
+  const series = getActiveSeries();
+
+  // — Cumulative —
+  const cum = filterByPeriod(series.dates, series.cumulative);
+  const profitColor = cv('--profit');
+  const lossColor   = cv('--loss');
+  const gradId = 'cumGrad_' + Date.now();
+  const ctx0 = document.getElementById('chart-cumulative').getContext('2d');
+  const grad = ctx0.createLinearGradient(0, 0, 0, 280);
+  grad.addColorStop(0, profitColor + '33');
+  grad.addColorStop(1, profitColor + '00');
+
+  const lastVal = cum.values.length ? cum.values[cum.values.length - 1] : 0;
+  const lineColor = lastVal >= 0 ? profitColor : lossColor;
+
+  makeOrUpdate('chart-cumulative', 'line', {
+    labels: cum.dates,
+    datasets: [{
+      label: 'Cumulative P&L',
+      data: cum.values,
+      borderColor: lineColor,
+      borderWidth: 2,
+      pointRadius: cum.dates.length > 100 ? 0 : 3,
+      pointHoverRadius: 5,
+      fill: true,
+      backgroundColor: grad,
+      tension: 0.3,
+    }]
+  }, {
+    ...baseChartOptions(),
+    plugins: {
+      ...baseChartOptions().plugins,
+      annotation: {
+        annotations: {
+          zeroLine: {
+            type: 'line', yMin: 0, yMax: 0,
+            borderColor: cv('--faint'), borderWidth: 1, borderDash: [4,4],
+          }
+        }
+      }
+    }
+  });
+
+  // — Daily P&L —
+  const daily = filterByPeriod(series.dates, series.daily_pnl);
+  makeOrUpdate('chart-daily', 'bar', {
+    labels: daily.dates,
+    datasets: [{
+      label: 'Daily P&L',
+      data: daily.values,
+      backgroundColor: daily.values.map(v => v >= 0 ? profitColor + 'cc' : lossColor + 'cc'),
+      borderRadius: 3,
+      borderSkipped: false,
+    }]
+  }, baseChartOptions());
+
+  // — Drawdown —
+  const dd = filterByPeriod(series.dates, series.drawdown);
+  const ddCtx = document.getElementById('chart-drawdown').getContext('2d');
+  const ddGrad = ddCtx.createLinearGradient(0, 0, 0, 220);
+  ddGrad.addColorStop(0, cv('--drawdown') + '44');
+  ddGrad.addColorStop(1, cv('--drawdown') + '00');
+  makeOrUpdate('chart-drawdown', 'line', {
+    labels: dd.dates,
+    datasets: [{
+      label: 'Drawdown',
+      data: dd.values,
+      borderColor: cv('--drawdown'),
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: true,
+      backgroundColor: ddGrad,
+      tension: 0.2,
+    }]
+  }, baseChartOptions());
+
+  // — Monthly —
+  let monthly = series.monthly_pnl || [];
+  if (PERIOD_DAYS) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - PERIOD_DAYS);
+    const cutMon = cutoff.toISOString().slice(0, 7);
+    monthly = monthly.filter(m => m.month >= cutMon);
+  }
+  makeOrUpdate('chart-monthly', 'bar', {
+    labels: monthly.map(m => m.month),
+    datasets: [{
+      data: monthly.map(m => m.pnl),
+      backgroundColor: monthly.map(m => m.pnl >= 0 ? profitColor + 'cc' : lossColor + 'cc'),
+      borderRadius: 4,
+      borderSkipped: false,
+    }]
+  }, baseChartOptions());
+
+  // — By Strategy (horizontal bar) —
+  const stratData = series.by_strategy || {};
+  const stratEntries = Object.entries(stratData).sort((a,b) => b[1]-a[1]);
+  makeOrUpdate('chart-strategy', 'bar', {
+    labels: stratEntries.map(e => e[0]),
+    datasets: [{
+      data: stratEntries.map(e => e[1]),
+      backgroundColor: stratEntries.map(e => e[1] >= 0 ? profitColor + 'cc' : lossColor + 'cc'),
+      borderRadius: 4,
+    }]
+  }, {
+    ...baseChartOptions(),
+    indexAxis: 'y',
+  });
+
+  // — KPIs —
+  renderKPIs(series.stats);
+
+  // — Trades table —
+  renderTradesTable();
+}
+
+function renderTradesTable() {
+  const trades = DATA.trades
+    .filter(t => ACTIVE_SOURCE === 'all' || t.source === ACTIVE_SOURCE)
+    .slice(-50)
+    .reverse();
+  const fmt = n => new Intl.NumberFormat('en-IN').format(Math.round(n));
+  const rows = trades.map(t => {
+    const cls = t.net_pnl >= 0 ? 'pos' : 'neg';
+    return `<tr>
+      <td>${t.date}</td>
+      <td>${t.symbol}</td>
+      <td>${t.strategy || '—'}</td>
+      <td>${t.source}</td>
+      <td class="${cls}">₹${fmt(t.net_pnl)}</td>
+      <td>${t.exit_reason || '—'}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('trades-table-wrap').innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Date</th><th>Symbol</th><th>Strategy</th>
+        <th>Source</th><th>Net P&amp;L</th><th>Exit Reason</th>
+      </tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted)">No trades in period</td></tr>'}</tbody>
+    </table>
+  `;
+}
+
+// ── BOOT ─────────────────────────────────────────────────────────────
+loadData();
+</script>
+</body>
+</html>

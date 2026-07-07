@@ -89,11 +89,29 @@ def load_config(path: str = "config.yaml") -> dict:
         return _CONFIG_CACHE
     cfg_path = Path(path)
     if not cfg_path.exists():
-        # Try relative to this file's parent-parent (project root)
         cfg_path = Path(__file__).parent.parent / "config.yaml"
     with open(cfg_path, encoding="utf-8") as f:
         _CONFIG_CACHE = yaml.safe_load(f)
     return _CONFIG_CACHE
+
+
+# ── Instrument key helper ─────────────────────────────────────────────
+
+def get_instrument_key(symbol: str, config_path: str = "config.yaml") -> str:
+    """
+    Return the correct instrument key for the configured broker.
+
+    - Upstox  → instruments.<symbol>.upstox_key
+    - Zerodha → instruments.<symbol>.zerodha_symbol
+
+    Falls back to upstox_key when zerodha_symbol is missing.
+    """
+    cfg = load_config(config_path)
+    broker = cfg.get("broker", {}).get("primary", "upstox")
+    inst = cfg["instruments"][symbol]
+    if broker == "zerodha":
+        return inst.get("zerodha_symbol") or inst["upstox_key"]
+    return inst["upstox_key"]
 
 
 # ── Logging setup ─────────────────────────────────────────────────────
@@ -143,18 +161,35 @@ def get_broker(config_path: str = "config.yaml"):
         from src.broker.upstox import UpstoxBroker
         token = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
         if not token:
-            raise EnvironmentError("UPSTOX_ACCESS_TOKEN not set in .env")
+            raise EnvironmentError(
+                "UPSTOX_ACCESS_TOKEN not set in .env\n"
+                "Get it from: https://login.upstox.com → API → Access Token"
+            )
         return UpstoxBroker(
             access_token=token,
             request_delay_s=cfg["broker"].get("request_delay_s", 0.35),
             timeout_s=cfg["broker"].get("timeout_s", 10),
             max_retries=cfg["broker"].get("max_retries", 3),
         )
+
     elif primary == "zerodha":
         from src.broker.zerodha import ZerodhaBroker
-        return ZerodhaBroker(
-            api_key=os.environ["ZERODHA_API_KEY"],
-            access_token=os.environ["ZERODHA_ACCESS_TOKEN"],
-        )
+        api_key = os.environ.get("ZERODHA_API_KEY", "")
+        access_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "")
+        if not api_key:
+            raise EnvironmentError(
+                "ZERODHA_API_KEY not set in .env\n"
+                "Get it from: https://kite.trade → My Apps → API Key"
+            )
+        if not access_token:
+            raise EnvironmentError(
+                "ZERODHA_ACCESS_TOKEN not set in .env\n"
+                "Generate it each morning via Kite Connect login flow."
+            )
+        return ZerodhaBroker(api_key=api_key, access_token=access_token)
+
     else:
-        raise ValueError(f"Unknown broker: {primary}")
+        raise ValueError(
+            f"Unknown broker '{primary}' in config.yaml. "
+            "Valid values: 'upstox', 'zerodha'"
+        )

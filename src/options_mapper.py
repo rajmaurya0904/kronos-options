@@ -14,14 +14,13 @@ Strategy logic:
   STRONG_BEARISH  → Buy ATM PE  (or Bear Put Spread if configured)
 """
 from __future__ import annotations
-import json
 import logging
 from typing import Optional
 
 import pandas as pd
 
 from src.broker.base import BrokerInterface
-from src.utils import load_config, round_to_atm
+from src.utils import load_config, round_to_atm, get_instrument_key
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +34,7 @@ class OptionsMapper:
     ):
         self.broker = broker
         self.cfg = load_config(config_path)
+        self.config_path = config_path
         self.db_path = db_path
 
     def map(
@@ -64,7 +64,7 @@ class OptionsMapper:
         inst_cfg  = self.cfg["instruments"][symbol]
         atm_step  = inst_cfg["atm_step"]
         lot_size  = inst_cfg["lot_size"]
-        inst_key  = inst_cfg["upstox_key"]
+        inst_key  = get_instrument_key(symbol, self.config_path)
         spread_steps = self.cfg.get("options", {}).get("spread_otm_strikes", 1)
         lots = self.cfg.get("paper_trading", {}).get("lots", 1)
 
@@ -81,21 +81,18 @@ class OptionsMapper:
         # Determine strategy
         strategy_map = self.cfg.get("options", {}).get("default_strategy", {})
 
-        # Neutral strategy depends on regime
         if sig == "NEUTRAL":
             if dispersion_regime == "high" and iv_regime in (None, "low"):
                 sig_key = "NEUTRAL_HIGH_DISP_LOW_IV"
             elif dispersion_regime == "low" and iv_regime == "high":
                 sig_key = "NEUTRAL_LOW_DISP_HIGH_IV"
             else:
-                # Default neutral: no trade
                 return self._no_trade(symbol, "NEUTRAL — no clear volatility edge")
         else:
             sig_key = sig
 
         strategy = strategy_map.get(sig_key, "buy_atm_ce")
 
-        # Build legs
         legs = self._build_legs(
             strategy=strategy,
             atm_strike=atm_strike,
@@ -108,7 +105,6 @@ class OptionsMapper:
         if not legs:
             return self._no_trade(symbol, f"Could not build legs for {strategy}")
 
-        # Compute risk/reward
         metrics = self._compute_metrics(strategy, legs, lot_size)
 
         rec = {
@@ -198,13 +194,13 @@ class OptionsMapper:
                  "ltp": get_ltp(atm_strike, "PE")},
             ],
             "iron_condor": lambda: [
-                {"strike": atm_strike - otm,       "option_type": "PE", "action": "BUY",  "lots": lots,
+                {"strike": atm_strike - otm, "option_type": "PE", "action": "BUY",  "lots": lots,
                  "ltp": get_ltp(atm_strike - otm, "PE")},
-                {"strike": atm_strike,             "option_type": "PE", "action": "SELL", "lots": lots,
+                {"strike": atm_strike,       "option_type": "PE", "action": "SELL", "lots": lots,
                  "ltp": get_ltp(atm_strike, "PE")},
-                {"strike": atm_strike,             "option_type": "CE", "action": "SELL", "lots": lots,
+                {"strike": atm_strike,       "option_type": "CE", "action": "SELL", "lots": lots,
                  "ltp": get_ltp(atm_strike, "CE")},
-                {"strike": atm_strike + otm,       "option_type": "CE", "action": "BUY",  "lots": lots,
+                {"strike": atm_strike + otm, "option_type": "CE", "action": "BUY",  "lots": lots,
                  "ltp": get_ltp(atm_strike + otm, "CE")},
             ],
         }
@@ -222,24 +218,20 @@ class OptionsMapper:
         Compute max profit, max loss, and breakevens from leg premiums.
         These are approximate (based on LTP at time of signal) — actual fill prices will differ.
         """
-        # Net premium: positive = credit received, negative = debit paid
         net_premium_pts = sum(
             (leg["ltp"] if leg["action"] == "SELL" else -leg["ltp"]) * leg["lots"]
             for leg in legs
         )
         net_premium_rs = net_premium_pts * lot_size
 
-        # Strategy-specific logic
         if strategy in ("buy_atm_ce", "buy_atm_pe"):
-            # Max loss = premium paid; max profit = theoretically unlimited (capped at 5×)
             debit = abs(net_premium_rs)
             return {
                 "max_loss_rs":   -debit,
-                "max_profit_rs": debit * 5,  # placeholder — depends on move
+                "max_profit_rs": debit * 5,
                 "net_premium_rs": net_premium_rs,
             }
         elif strategy in ("bull_put_spread", "bear_call_spread"):
-            # Credit spread: max profit = credit received, max loss = spread width - credit
             width = abs(legs[0]["strike"] - legs[1]["strike"]) * lot_size * legs[0]["lots"]
             credit = net_premium_rs
             atm = legs[0]["strike"]
@@ -253,7 +245,6 @@ class OptionsMapper:
                 "net_premium_rs": net_premium_rs,
             }
         elif strategy in ("bull_call_spread", "bear_put_spread"):
-            # Debit spread
             debit = -net_premium_rs
             width = abs(legs[0]["strike"] - legs[1]["strike"]) * lot_size * legs[0]["lots"]
             return {
