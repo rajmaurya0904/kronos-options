@@ -253,6 +253,10 @@ Please run the backtest and paper trader for several weeks before even consideri
 - [ ] Per-trade stop-loss and target exits
 - [ ] Complete the Zerodha broker implementation
 
+## Contributing
+
+Stars, issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the test command and good first contributions.
+
 ## Acknowledgements
 
 - [**Kronos**](https://github.com/shiyu-coder/Kronos) by shiyu-coder, the foundation model behind the forecasts
