@@ -233,6 +233,9 @@ elif page == "Backtest Results":
             col1, col2 = st.columns(2)
             with col1:
                 bs_pct = (trades["data_source"] == "bs_approximation").mean() * 100
-                st.warning(f"⚠ {bs_pct:.1f}% of trades used Black-Scholes approximation "
-                           f"(real option data unavailable). Filter these for accurate stats.")
+                if bs_pct > 0:
+                    st.warning(f"⚠ {bs_pct:.1f}% of trades used Black-Scholes approximation "
+                               f"(real option data unavailable). Filter these for accurate stats.")
+                else:
+                    st.success("All trades priced from real option data.")
             st.dataframe(trades, use_container_width=True)

@@ -71,6 +71,36 @@ Confidence is `0.6 × conviction + 0.4 × magnitude`. Conviction is how far `pro
 
 Every threshold and strategy choice lives in [`config.yaml`](config.yaml), so you can tune them without touching code.
 
+## Screenshots
+
+Real output, not mock-ups: a NIFTY backtest run in GitHub Actions on live Upstox data, then the dashboard captured headless.
+
+<p align="center">
+  <img src="docs/screenshots/live-forecasts.png" alt="Live Forecasts page: expected move, probability up, path dispersion and a fan chart of sampled Kronos forecast paths" width="900">
+  <br><em>Live Forecasts: Kronos samples several futures; the bold line is the median path.</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/backtest-results.png" alt="Backtest Results page: run summary, equity curve by trade and the trade log" width="900">
+  <br><em>Backtest Results: equity curve and trade log. Every trade here was priced from real option candles.</em>
+</p>
+
+## Sample backtest
+
+NIFTY, 7–25 Sep 2026, 1 lot, signal every 30 min, intraday square-off at 15:15. All costs included.
+
+| Trades | Win rate | Net P&L | Avg win | Avg loss | Profit factor | Max drawdown |
+|---|---|---|---|---|---|---|
+| 11 | 27.3% (3W / 8L) | ₹+6,934 | ₹+3,438 | ₹−422 | 3.05 | ₹−2,318 |
+
+**Read this as a demo, not as evidence of an edge.** Eleven trades over three weeks is far too few to judge a strategy. One trade (11 Sep, a long call, ₹+8,347) produced more than the entire net profit; without it the period was ₹−1,413. Over a sample this small the Sharpe ratio means nothing, so it is left out here. Run longer periods yourself before drawing any conclusion.
+
+Reproduce it: **Actions → dashboard screenshots → Run workflow** (needs an `UPSTOX_ACCESS_TOKEN` repo secret), or locally:
+
+```bash
+python run_backtest.py --symbol NIFTY --start 2026-09-07 --end 2026-09-25
+```
+
 ## Features
 
 - 🧠 **Probabilistic forecasts.** Several sampled paths per bar, so you get a distribution and not a single guess.
@@ -213,11 +243,11 @@ Please run the backtest and paper trader for several weeks before even consideri
 - SENSEX index volume is often zero (BSE methodology). It is flagged and not used as a feature.
 - The Black-Scholes fallback assumes 15% IV and a 6.5% risk-free rate, and is used only when real data is missing.
 - Upstox's expired-instruments history may not reach back far enough for older backtests.
-- This repo ships **no backtest results**. Run your own, over your own period, and look at the real-data trades first.
+- The only published result is the three-week sample above. Run your own, over longer periods, and look at the real-data trades first.
 
 ## Roadmap
 
-- [ ] Publish a reference backtest with walk-forward splits
+- [ ] Publish a longer reference backtest with walk-forward splits
 - [ ] Automatic daily Upstox token refresh
 - [x] Expiry days and historical lot sizes from the broker
 - [ ] Per-trade stop-loss and target exits

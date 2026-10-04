@@ -54,17 +54,13 @@ def clean(
     times = df.index.time
     df = df[(times >= MARKET_OPEN) & (times < MARKET_CLOSE)]
 
-    # ── SENSEX zero-volume handling ────────────────────────────────────
-    # BSE index feed often reports volume = 0. We keep these bars but flag them
-    # so downstream (forecaster) can decide whether to use the volume feature.
+    # ── Zero-volume handling ───────────────────────────────────────────
+    # Index candles (NIFTY, BANKNIFTY, SENSEX) carry no traded volume, so
+    # volume = 0 is normal here. Kronos fills a constant-zero volume itself.
     if "volume" in df.columns:
-        zero_vol = (df["volume"] == 0).sum()
-        if zero_vol > 0:
-            if symbol.upper() == "SENSEX":
-                logger.debug("SENSEX: %d bars with zero volume (expected — BSE index)", zero_vol)
-                df["volume_synthetic"] = False
-            else:
-                logger.warning("%s: %d bars with zero volume (unexpected)", symbol, zero_vol)
+        zero_vol = int((df["volume"] == 0).sum())
+        if zero_vol:
+            logger.debug("%s: %d bars with zero volume (normal for an index)", symbol, zero_vol)
 
     # ── Drop bars with NaN OHLC ────────────────────────────────────────
     df = df.dropna(subset=["open", "high", "low", "close"])
