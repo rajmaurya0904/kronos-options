@@ -22,7 +22,7 @@ permissions:
 jobs:
   screenshots:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300   # a 3-month backtest takes ~1.5h on a CPU runner
     env:
       UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
       KRONOS_REPO_PATH: ${{ github.workspace }}/Kronos
