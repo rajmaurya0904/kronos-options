@@ -1,260 +1,230 @@
-# Kronos Options Signal System
+<div align="center">
 
-Intraday options signal system for NIFTY, BANKNIFTY, and SENSEX using the
-[Kronos foundation model](https://github.com/shiyu-coder/Kronos) for probabilistic
-index price forecasting. Converts index forecasts into concrete option trade
-recommendations with realistic cost modelling.
+# 📈 Kronos Options
 
-**Data source: Upstox v2 API** (real historical option prices via expired-instruments API).
+**An AI signal engine for Indian index options.**
+A candlestick foundation model forecasts NIFTY, BANKNIFTY and SENSEX. Those forecasts become concrete option trades, priced with real historical option data and realistic costs.
 
----
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-3776AB?logo=python&logoColor=white)
+![Model](https://img.shields.io/badge/model-Kronos--small%20(24.7M)-7C3AED)
+![Data](https://img.shields.io/badge/data-Upstox%20v2-FF6B00)
+![Dashboard](https://img.shields.io/badge/dashboard-Streamlit-FF4B4B?logo=streamlit&logoColor=white)
+![Runs on](https://img.shields.io/badge/runs%20on-CPU%20%C2%B7%208%20GB%20RAM-2EA043)
+![Mode](https://img.shields.io/badge/default-paper%20trading-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-## Architecture
-
-```
-market data → DataFetcher → DataCleaner → KronosForecaster
-                                                 ↓
-                                         SignalEngine (BULLISH / BEARISH / NEUTRAL + confidence)
-                                                 ↓
-                                         OptionsMapper (pick strikes, strategy, lot sizes)
-                                                 ↓
-                                      ┌─── Backtester (historical walk-forward)
-                                      └─── PaperTrader (live loop, no real orders)
-                                                 ↓
-                                          Streamlit Dashboard
-```
+</div>
 
 ---
 
-## Windows Setup (8 GB RAM, no GPU)
+## What it does
 
-### 1. Prerequisites
+Most retail "signals" are an indicator crossing a line. Kronos Options asks a different question: **given the last 400 five-minute candles, what is the *distribution* of where the index goes in the next hour?**
 
+1. [**Kronos**](https://github.com/shiyu-coder/Kronos), a foundation model for financial candlesticks, samples several possible future paths.
+2. The signal engine reads that cloud of paths: how many end higher, how far they move, and how spread out they are.
+3. The options mapper turns the reading into a trade: strategy, strikes and lot size.
+4. Everything is checked against real option prices and a full Indian cost model, in a backtest or in a live paper-trading loop.
+
+It does not always trade. The neutral zone is deliberately wide, so the engine would rather miss a trade than force one.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Upstox API<br/>5-min candles] --> B[DataCleaner<br/>hours, holidays, gaps]
+    B --> C[KronosForecaster<br/>N sampled paths]
+    C --> D[SignalEngine<br/>direction + confidence]
+    D --> E[OptionsMapper<br/>strategy, strikes, lots]
+    E --> F[Backtester<br/>walk-forward]
+    E --> G[PaperTrader<br/>live loop, no orders]
+    F --> H[(SQLite)]
+    G --> H
+    H --> I[Streamlit dashboard]
 ```
-Python 3.10 or 3.11 (https://www.python.org/downloads/)
-Git (https://git-scm.com/download/win)
-```
 
-### 2. Clone this repo and install dependencies
+### From forecast to signal
 
-```powershell
-cd C:\Users\YourName\Desktop
-git clone <this-repo-url> kronos_options
-cd kronos_options
+The engine requires probability and magnitude to agree before going directional. A high up-probability with a tiny expected move stays `NEUTRAL`.
+
+| Signal | `prob_up` | Expected move |
+|---|---|---|
+| `STRONG_BULLISH` | ≥ 0.75 | ≥ +0.50% |
+| `BULLISH` | ≥ 0.65 | ≥ +0.25% |
+| `NEUTRAL` | everything else | everything else |
+| `BEARISH` | ≤ 0.35 | ≤ −0.25% |
+| `STRONG_BEARISH` | ≤ 0.25 | ≤ −0.50% |
+
+Confidence is `0.6 × conviction + 0.4 × magnitude`. Conviction is how far `prob_up` sits from 0.5, and magnitude is the expected move capped at 1%. The spread of the sampled paths sets the **dispersion regime**, and live implied volatility sets the **IV regime**.
+
+### From signal to trade
+
+| Signal | Regime | Default strategy |
+|---|---|---|
+| `STRONG_BULLISH` | – | Buy ATM CE |
+| `BULLISH` | – | Bull put spread |
+| `NEUTRAL` | high dispersion, low IV | Long straddle |
+| `NEUTRAL` | low dispersion, high IV | Iron condor |
+| `BEARISH` | – | Bear call spread |
+| `STRONG_BEARISH` | – | Buy ATM PE |
+
+Every threshold and strategy choice lives in [`config.yaml`](config.yaml), so you can tune them without touching code.
+
+## Features
+
+- 🧠 **Probabilistic forecasts.** Several sampled paths per bar, so you get a distribution and not a single guess.
+- 🎯 **Three instruments.** NIFTY, BANKNIFTY and SENSEX, each with its own lot size, strike step and expiry day.
+- 🧾 **Real option prices.** The backtester pulls actual historical option OHLC from Upstox's expired-instruments API. If a bar is missing it falls back to Black-Scholes and tags the trade `bs_approximation`, so you can filter those out.
+- 💸 **Honest costs.** Brokerage, STT, exchange charges, GST, SEBI fees, stamp duty and one tick of slippage per side.
+- 🛡️ **Risk rules built in.** No trades in the first 5 minutes, none after 15:15, a hard 15:15 square-off, skipped expiry days and an event blackout calendar.
+- 📊 **Streamlit dashboard** with four pages: Live Forecasts, Today's Signals, Paper P&L and Backtest Results.
+- 🔌 **Broker-agnostic.** Upstox is the primary broker, behind a small interface. A Zerodha stub is included.
+- 🔒 **Triple-locked live mode.** Off by default (see [Live trading safety](#-live-trading-safety)).
+- ✅ **Tested.** 19 unit tests cover the utilities, the data cleaner and the signal engine.
+
+## Quick start
+
+> Runs on CPU. No GPU needed. Kronos-small is 24.7M parameters and fits comfortably in 8 GB of RAM.
+
+**1. Clone and install**
+
+```bash
+git clone https://github.com/rajmaurya0904/kronos-options.git
+cd kronos-options
 pip install -r requirements.txt
 ```
 
-### 3. Install Kronos model
+**2. Install the Kronos model code** (a separate repo; the weights download from Hugging Face on first run)
 
-```powershell
-cd C:\Users\YourName\Desktop
+```bash
 git clone https://github.com/shiyu-coder/Kronos
-cd Kronos
-pip install -r requirements.txt
+cd Kronos && pip install -r requirements.txt
 ```
 
-Note the full path to the Kronos folder — you'll need it in the next step.
+**3. Add credentials**
 
-### 4. Configure credentials
-
-```powershell
-copy .env.example .env
-notepad .env
+```bash
+cp .env.example .env     # on Windows: copy .env.example .env
 ```
 
-Fill in:
-- `UPSTOX_ACCESS_TOKEN` — get from Upstox Developer Console after daily login
-- `KRONOS_REPO_PATH` — full path to the cloned Kronos folder (e.g., `C:\Users\YourName\Desktop\Kronos`)
+Then fill in `.env`:
 
-### 5. Initialise database
+| Variable | What |
+|---|---|
+| `UPSTOX_ACCESS_TOKEN` | Your Upstox token (refresh it each morning before 09:15) |
+| `KRONOS_REPO_PATH` | Full path to the Kronos folder you just cloned |
 
-```powershell
+**4. Initialise and test**
+
+```bash
 python -c "from src.db import init_db; init_db()"
-```
-
-### 6. Test the setup
-
-```powershell
 pytest tests/ -v
 ```
 
----
+## Usage
 
-## Daily Workflow
+### Run a backtest
 
-### Step 1 — Refresh Upstox token (every morning before 9:15)
-
-Upstox access tokens expire daily. After logging in via the Upstox app or web:
-
-```powershell
-# Update UPSTOX_ACCESS_TOKEN in .env with today's token
-notepad .env
+```bash
+python run_backtest.py --symbol NIFTY --start 2026-05-01 --end 2026-06-09
+python run_backtest.py --symbol BANKNIFTY --start 2025-06-01 --end 2025-12-31 --lots 2
 ```
 
-### Step 2 — Fetch historical data (first time, or weekly top-up)
+It prints trades, win rate, total P&L, average win and loss, profit factor, Sharpe and max drawdown. It also warns you what share of trades fell back to Black-Scholes.
 
-```powershell
-python -c "
-from src.data_fetcher import DataFetcher
-from src.utils import get_broker
-f = DataFetcher(get_broker())
-for sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
-    df = f.fetch_date_range(sym, '2025-01-01', '2025-12-31')
-    print(sym, len(df), 'bars')
-"
+To keep only the trades priced from real option data:
+
+```python
+real = result["trade_log"][result["trade_log"]["data_source"] == "real_option_data"]
 ```
 
-### Step 3 — Run paper trader (market hours only)
+### Run the paper trader (market hours)
 
-```powershell
+```bash
 python -m src.paper_trader --symbols NIFTY BANKNIFTY
 ```
 
-### Step 4 — Open dashboard
+It wakes on every 5-minute bar, forecasts, signals, maps and logs a paper trade. It marks open positions to market and squares everything off at 15:15. **No orders are ever sent.**
 
-```powershell
+### Open the dashboard
+
+```bash
 streamlit run dashboard/app.py
 ```
 
-Visit `http://localhost:8501` in your browser.
+Then visit <http://localhost:8501>.
 
----
+## Configuration highlights
 
-## Module-by-Module Testing
+| Area | Key settings (`config.yaml`) |
+|---|---|
+| Model | `kronos.lookback: 400` bars in, `pred_len: 12` bars out (1 hour), `samples: 5`, `temperature: 1.0`, `top_p: 0.9` |
+| Session | `09:15–15:30` IST, no new trades after `15:15`, `skip_expiry_day: true` |
+| Sizing | `paper_trading.capital_per_trade: 50000`, `max_open_positions: 3` |
+| Instruments | NIFTY (lot 75, Thu expiry), BANKNIFTY (lot 15, Wed), SENSEX (lot 10, Fri) |
+| Costs | ₹20 per order, STT 0.05% on sell premium, 0.053% exchange charge, 18% GST, 1-tick slippage |
 
-### data_fetcher + data_cleaner
+Lot sizes and expiry days change. Check them against the exchange before trusting any result.
 
-```powershell
-python -c "
-from src.data_fetcher import DataFetcher
-from src.data_cleaner import clean
-from src.utils import get_broker
-f = DataFetcher(get_broker())
-df = f.fetch_date_range('NIFTY', '2025-06-01', '2025-06-10')
-print(clean(df, 'NIFTY').tail())
-"
-```
-Expected: 5-min bars, IST index, no weekends or 9:15 pre-market candles.
-
-### forecaster
-
-```powershell
-python -c "
-from src.forecaster import KronosForecaster
-from src.data_fetcher import DataFetcher
-from src.data_cleaner import clean
-from src.utils import get_broker
-df = clean(DataFetcher(get_broker()).fetch_date_range('NIFTY', '2025-06-01', '2025-06-10'))
-fc = KronosForecaster().forecast('NIFTY', df)
-print('prob_up:', fc['prob_up'], 'move:', fc['expected_move_pct'])
-"
-```
-Expected: dict with `prob_up`, `expected_move_pct`, `median_path` DataFrame.
-
-### signal_engine
-
-```powershell
-pytest tests/test_signal_engine.py -v
-```
-Expected: all 7 tests pass.
-
-### backtester
-
-```powershell
-python -c "
-from src.backtester import Backtester
-from src.utils import get_broker
-bt = Backtester(get_broker())
-r = bt.run('NIFTY', '2025-01-01', '2025-03-31')
-print(r['stats'])
-"
-```
-Expected: stats dict with total_trades, win_rate_pct, total_pnl_rs, sharpe.
-
----
-
-## Backtesting Notes
-
-The backtester uses **real Upstox historical option OHLC data** via the
-`/expired-instruments/historical-candle` API endpoint — the same approach
-as your existing `nifty_first_candle_v5.py` script. This is significantly
-more accurate than Black-Scholes approximation.
-
-When real data is unavailable for a bar, the backtester falls back to
-Black-Scholes and tags the trade `data_source=bs_approximation`.
-Filter these out of performance stats for clean analysis:
-
-```python
-real_trades = results["trade_log"][results["trade_log"]["data_source"] == "real_option_data"]
-```
-
----
-
-## Key Assumptions
-
-| # | Assumption | Impact |
-|---|-----------|--------|
-| 1 | Lot sizes from config.yaml (NIFTY=75, BN=15, SENSEX=10) | Update when NSE revises; or fetch from broker at runtime |
-| 2 | Kronos model API follows the pattern in its README | Adjust `_run_kronos()` in forecaster.py if API differs |
-| 3 | SENSEX volume = 0 is normal (BSE index methodology) | Flagged but not dropped; volume feature ignored for SENSEX |
-| 4 | Black-Scholes fallback uses IV=15% and r=6.5% | Only for missing data; clearly tagged in trade log |
-| 5 | Upstox `expired-instruments` API covers all needed history | Verify for dates > 2 years old; may need TrueData for older data |
-| 6 | Weekly expiry: NIFTY=Thursday, BANKNIFTY=Wednesday, SENSEX=Friday | Update if NSE/BSE changes expiry day |
-
----
-
-## File Structure
+## Project structure
 
 ```
-kronos_options/
-├── config.yaml           ← all settings, no credentials
-├── .env                  ← credentials (gitignored)
-├── requirements.txt
-├── README.md
-├── data/
-│   ├── historical/       ← cached 5-min CSV per symbol
-│   └── kronos_options.db ← SQLite: forecasts, signals, trades, P&L
+kronos-options/
+├── config.yaml            all settings, no credentials
+├── run_backtest.py        backtest CLI
+├── dashboard/app.py       Streamlit dashboard (4 pages)
 ├── src/
-│   ├── broker/
-│   │   ├── base.py       ← BrokerInterface ABC
-│   │   ├── upstox.py     ← PRIMARY: Upstox v2 REST
-│   │   └── zerodha.py    ← STUB: swap when needed
-│   ├── data_fetcher.py   ← fetch + cache OHLCV + option candles
-│   ├── data_cleaner.py   ← filter market hours, holidays, gaps
-│   ├── forecaster.py     ← Kronos-small wrapper
-│   ├── signal_engine.py  ← forecast → signal
-│   ├── options_mapper.py ← signal → option trade legs
-│   ├── backtester.py     ← walk-forward backtest, real option prices
-│   ├── paper_trader.py   ← live loop, no real orders
-│   ├── live_trader.py    ← real orders (triple-locked, disabled by default)
-│   ├── db.py             ← SQLite schema and helpers
-│   └── utils.py          ← IST helpers, holidays, config loader, broker factory
-├── dashboard/
-│   └── app.py            ← Streamlit: 4 pages
-├── notebooks/
-│   ├── 01_data_exploration.ipynb
-│   ├── 02_first_forecast.ipynb
-│   └── 03_signal_tuning.ipynb
-└── tests/
-    ├── test_utils.py
-    ├── test_data_cleaner.py
-    └── test_signal_engine.py
+│   ├── broker/            base interface · Upstox (primary) · Zerodha (stub)
+│   ├── data_fetcher.py    candles + option candles, cached to CSV
+│   ├── data_cleaner.py    market hours, holidays, gaps
+│   ├── forecaster.py      Kronos-small wrapper, forecast cache
+│   ├── signal_engine.py   forecast → signal
+│   ├── options_mapper.py  signal → option legs
+│   ├── backtester.py      walk-forward, real option prices
+│   ├── paper_trader.py    live loop, no real orders
+│   ├── live_trader.py     real orders (triple-locked, disabled)
+│   ├── db.py              SQLite schema and helpers
+│   └── utils.py           IST helpers, config loader, broker factory
+└── tests/                 pytest suite
 ```
 
----
+## 🔒 Live trading safety
 
-## Live Trading Safety
-
-Live trading has a **triple lock**:
+Live order placement exists but is **off by default**, and it takes three separate actions to turn on:
 
 1. `LIVE_TRADING=true` in `.env`
-2. `--live` CLI flag
-3. Typed confirmation: `I CONFIRM LIVE TRADING`
+2. the `--live` flag on the command line
+3. typing `I CONFIRM LIVE TRADING` at the startup prompt
 
-Plus hard limits in `config.yaml` → `live_trading`:
-- `max_trades_per_day: 3`
-- `max_capital_per_trade: 50000`
-- `max_daily_loss_rs: -5000` → kills all trading for the day if hit
+On top of that, `config.yaml` sets hard limits: at most **3 trades a day**, **₹50,000 per trade**, and a **−₹5,000 daily loss kill-switch** that stops trading for the day.
 
-Do not enable live trading until you have run the backtest and paper trader
-for at least 4 weeks and are comfortable with the signal quality.
+Please run the backtest and paper trader for several weeks before even considering live mode.
+
+## Known assumptions and limits
+
+- The Kronos wrapper follows the model repo's documented API. If upstream changes it, adjust `_run_kronos()` in `src/forecaster.py`.
+- Upstox access tokens expire daily, so you need a fresh one each morning.
+- SENSEX index volume is often zero (BSE methodology). It is flagged and not used as a feature.
+- The Black-Scholes fallback assumes 15% IV and a 6.5% risk-free rate, and is used only when real data is missing.
+- Upstox's expired-instruments history may not reach back far enough for older backtests.
+- This repo ships **no backtest results**. Run your own, over your own period, and look at the real-data trades first.
+
+## Roadmap
+
+- [ ] Publish a reference backtest with walk-forward splits
+- [ ] Automatic daily Upstox token refresh
+- [ ] Fetch lot sizes and expiry days from the broker at runtime
+- [ ] Complete the Zerodha broker implementation
+
+## Acknowledgements
+
+- [**Kronos**](https://github.com/shiyu-coder/Kronos) by shiyu-coder, the foundation model behind the forecasts
+- [**Upstox**](https://upstox.com/developer/api-documentation/) for market and option data
+
+## ⚠️ Disclaimer
+
+This is research and educational software, **not financial advice**. Options trading carries a high risk of loss. Forecasts are probabilistic and can be wrong, and past or simulated performance does not predict future results. You are responsible for any decision you make with this code.
+
+## License
+
+Released under the [MIT License](LICENSE).
