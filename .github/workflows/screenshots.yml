@@ -1,0 +1,64 @@
+name: dashboard screenshots
+
+# Manual only. Runs a real backtest with your Upstox token (repo secret
+# UPSTOX_ACCESS_TOKEN), starts the dashboard and screenshots every page.
+# Results come back as a downloadable artifact; nothing is committed.
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: NIFTY | BANKNIFTY | SENSEX
+        default: NIFTY
+      start:
+        description: Backtest start (YYYY-MM-DD)
+        default: "2026-09-07"
+      end:
+        description: Backtest end (YYYY-MM-DD)
+        default: "2026-09-25"
+
+permissions:
+  contents: read
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+      KRONOS_REPO_PATH: ${{ github.workspace }}/Kronos
+      LIVE_TRADING: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check the token secret exists
+        run: test -n "$UPSTOX_ACCESS_TOKEN" || { echo "Add the UPSTOX_ACCESS_TOKEN repo secret first"; exit 1; }
+
+      - name: Install (CPU torch, Kronos pinned)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          git clone https://github.com/shiyu-coder/Kronos "$KRONOS_REPO_PATH"
+          git -C "$KRONOS_REPO_PATH" checkout 67b630e67f6a18c9e9be918d9b4337c960db1e9a
+          pip install -r "$KRONOS_REPO_PATH/requirements.txt" -r requirements.txt playwright
+          playwright install --with-deps chromium
+
+      - name: Backtest
+        run: |
+          python -c "from src.db import init_db; init_db()"
+          python run_backtest.py --symbol "${{ inputs.symbol }}" --start "${{ inputs.start }}" --end "${{ inputs.end }}" 2>&1 | tee backtest.txt
+
+      - name: Screenshot the dashboard
+        run: |
+          streamlit run dashboard/app.py --server.headless true --server.port 8501 &
+          for i in $(seq 1 60); do curl -sf http://localhost:8501/_stcore/health && break; sleep 2; done
+          python scripts/capture_dashboard.py http://localhost:8501 screenshots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dashboard-screenshots
+          path: |
+            screenshots/
+            backtest.txt

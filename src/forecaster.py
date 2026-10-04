@@ -237,6 +237,7 @@ class KronosForecaster:
                     T=temperature,
                     top_p=top_p,
                     sample_count=1,
+                    verbose=False,   # no tqdm bar per sample
                 )
                 close_vals = pred_df["close"].values[:pred_len].astype(float)
                 all_paths.append(close_vals)

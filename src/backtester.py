@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -45,6 +45,9 @@ from src.utils import load_config, IST, is_event_day
 from src.db import init_db, get_conn
 
 logger = logging.getLogger(__name__)
+
+# Calendar days fetched before `start` (400 five-minute bars ≈ 5.3 sessions).
+WARMUP_DAYS = 14
 
 
 class Backtester:
@@ -89,9 +92,12 @@ class Backtester:
         """
         logger.info("Starting backtest: %s %s → %s", symbol, start, end)
 
-        # Load and clean historical index data
-        df_raw = self.fetcher.fetch_date_range(symbol, start, end, bar_resolution)
+        # Load and clean historical index data, plus a warm-up window before
+        # `start` so the first test day already has a full lookback.
+        warmup = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=WARMUP_DAYS)).strftime("%Y-%m-%d")
+        df_raw = self.fetcher.fetch_date_range(symbol, warmup, end, bar_resolution)
         df = clean(df_raw, symbol=symbol)
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
 
         if df.empty:
             raise ValueError(f"No clean data for {symbol} {start}→{end}")
@@ -123,7 +129,9 @@ class Backtester:
         open_trade: Optional[dict] = None
         bar_count = 0
 
-        dates = sorted(set(df.index.date))
+        dates = sorted(d for d in set(df.index.date) if d >= start_date)
+        if not dates:
+            raise ValueError(f"No sessions for {symbol} between {start} and {end}")
 
         for d in dates:
             date_str = d.strftime("%Y-%m-%d")
