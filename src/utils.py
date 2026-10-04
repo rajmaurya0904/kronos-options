@@ -1,9 +1,11 @@
 """
-Shared utilities: IST timezone helpers, lot sizes, holiday calendar, logging setup.
+Shared utilities: IST timezone helpers, holiday calendar, event calendar, logging setup.
+Lot sizes live in config.yaml (and, in the backtester, come from each contract).
 """
 from __future__ import annotations
 import logging
 import logging.handlers
+import math
 import os
 from datetime import date, datetime, time as dtime
 from pathlib import Path
@@ -15,31 +17,28 @@ import yaml
 IST = pytz.timezone("Asia/Kolkata")
 
 # ── NSE/BSE Holiday Calendar (update annually) ────────────────────────
-# Source: NSE official holiday list.
+# Weekday trading holidays only (equity + equity derivatives).
+# Source: NSE official holiday circulars. Update every December.
 NSE_HOLIDAYS: set[date] = {
     # 2024
-    date(2024, 1, 22), date(2024, 3, 25), date(2024, 3, 29),
-    date(2024, 4, 14), date(2024, 4, 17), date(2024, 5, 23),
+    date(2024, 1, 22), date(2024, 1, 26), date(2024, 3, 8),
+    date(2024, 3, 25), date(2024, 3, 29), date(2024, 4, 11),
+    date(2024, 4, 17), date(2024, 5, 1),  date(2024, 5, 20),
     date(2024, 6, 17), date(2024, 7, 17), date(2024, 8, 15),
-    date(2024, 10, 2), date(2024, 10, 24), date(2024, 11, 15),
-    date(2024, 12, 25),
+    date(2024, 10, 2), date(2024, 11, 1), date(2024, 11, 15),
+    date(2024, 11, 20), date(2024, 12, 25),
     # 2025
-    date(2025, 2, 26), date(2025, 3, 14), date(2025, 4, 14),
-    date(2025, 4, 17), date(2025, 8, 15), date(2025, 10, 2),
-    # 2026 — source: NSE holiday calendar
-    date(2026, 1, 1),  date(2026, 1, 26), date(2026, 3, 3),
-    date(2026, 4, 2),  date(2026, 4, 14), date(2026, 5, 1),
-    date(2026, 5, 24), date(2026, 8, 15), date(2026, 10, 2),
-    date(2026, 11, 5), date(2026, 11, 14), date(2026, 12, 25),
-}
-
-# Current lot sizes (update when NSE revises).
-# ASSUMPTION: These are best-known values as of June 2026.
-# At runtime, prefer fetching from broker API to catch changes.
-LOT_SIZES: dict[str, int] = {
-    "NIFTY":    75,
-    "BANKNIFTY": 15,
-    "SENSEX":   10,
+    date(2025, 2, 26), date(2025, 3, 14), date(2025, 3, 31),
+    date(2025, 4, 10), date(2025, 4, 14), date(2025, 4, 18),
+    date(2025, 5, 1),  date(2025, 8, 15), date(2025, 8, 27),
+    date(2025, 10, 2), date(2025, 10, 21), date(2025, 10, 22),
+    date(2025, 11, 5), date(2025, 12, 25),
+    # 2026
+    date(2026, 1, 26), date(2026, 3, 3),  date(2026, 3, 26),
+    date(2026, 3, 31), date(2026, 4, 3),  date(2026, 4, 14),
+    date(2026, 5, 1),  date(2026, 5, 28), date(2026, 6, 26),
+    date(2026, 9, 14), date(2026, 10, 2), date(2026, 10, 20),
+    date(2026, 11, 10), date(2026, 11, 24), date(2026, 12, 25),
 }
 
 MARKET_OPEN  = dtime(9, 15)
@@ -50,6 +49,17 @@ MARKET_CLOSE = dtime(15, 30)
 
 def now_ist() -> datetime:
     return datetime.now(IST)
+
+
+def today_ist() -> date:
+    """Today's date in India, whatever timezone the machine runs in."""
+    return now_ist().date()
+
+
+def is_event_day(d: date, config: dict) -> bool:
+    """True if d is in config.yaml event_calendar (RBI policy etc.)."""
+    events = config.get("event_calendar") or {}
+    return d.strftime("%Y-%m-%d") in {str(k) for k in events}
 
 
 def is_trading_day(d: Optional[date] = None) -> bool:
@@ -76,7 +86,9 @@ def parse_date(s: str) -> date:
 # ── Strike rounding ───────────────────────────────────────────────────
 
 def round_to_atm(price: float, atm_step: int) -> int:
-    return int(round(price / atm_step) * atm_step)
+    # Half-up, not Python's round(): banker's rounding sends 24325 to 24300
+    # but 24375 to 24400, so the ATM strike flipped direction at midpoints.
+    return int(math.floor(price / atm_step + 0.5) * atm_step)
 
 
 # ── Config loader ─────────────────────────────────────────────────────
@@ -109,8 +121,14 @@ def setup_logging(name: str = "kronos_options", config_path: str = "config.yaml"
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    logger = logging.getLogger(name)
+    # Handlers go on the root logger: every module logs via getLogger(__name__)
+    # ("src.paper_trader", "src.backtester", ...), so a handler on a logger
+    # called `name` would never see them and INFO trade logs were dropped.
+    logger = logging.getLogger()
     logger.setLevel(level)
+    if getattr(logger, "_kronos_configured", False):  # idempotent on re-entry
+        return logger
+    logger._kronos_configured = True
 
     # Console handler
     ch = logging.StreamHandler()

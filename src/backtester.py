@@ -6,13 +6,18 @@ For each bar in the test period:
   2. Run KronosForecaster on the lookback window.
   3. Generate signal via SignalEngine.
   4. Map to option trade via OptionsMapper.
-  5. Simulate entry/exit using REAL Upstox expired-instruments option prices.
-  6. Apply realistic brokerage, STT, and slippage.
+  5. Price EVERY leg at the real entry time and the real exit time using
+     Upstox expired-instruments 1-min option candles.
+  6. Apply per-leg brokerage, STT, exchange/SEBI fees, GST, stamp duty and
+     slippage (src/costs.py).
 
-IMPORTANT: This backtester uses ACTUAL historical option OHLC data from Upstox's
-expired-instruments API. No Black-Scholes approximation is needed.
-A Black-Scholes fallback is included for days where API data is unavailable —
-those trades are tagged "bs_approximation" in the trade log so you can filter them.
+A trade is priced either entirely from real option data or, if any leg is
+missing and backtest.bs_fallback_when_missing is true, entirely from a
+Black-Scholes estimate — never a mix. Fallback trades are tagged
+"bs_approximation" in the trade log so you can filter them.
+
+Positions are intraday: squared off at trading.square_off_time, or at the
+last bar of the day if the session ends early.
 
 Usage:
     backtester = Backtester(broker=get_broker())
@@ -20,74 +25,26 @@ Usage:
     results["equity_curve"].plot()
 """
 from __future__ import annotations
+import json
 import logging
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
+import math
+from datetime import datetime, time as dtime
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from src.broker.base import BrokerInterface
+from src.costs import trade_result
 from src.data_fetcher import DataFetcher
 from src.data_cleaner import clean, is_expiry_day
 from src.forecaster import KronosForecaster
 from src.signal_engine import SignalEngine
 from src.options_mapper import OptionsMapper
-from src.utils import load_config, IST, round_to_atm
+from src.utils import load_config, IST, is_event_day
 from src.db import init_db, get_conn
 
 logger = logging.getLogger(__name__)
-
-
-# ── Transaction cost calculator ───────────────────────────────────────
-
-def calc_charges(
-    entry_premium: float,
-    exit_premium: float,
-    lot_size: int,
-    lots: int,
-    n_legs: int,
-    cfg: dict,
-) -> float:
-    """
-    Compute realistic round-trip charges for an option trade.
-    Based on Zerodha/Upstox rate card (June 2026).
-    Returns total charges in ₹.
-
-    Leg count matters: spreads have 2x the legs of outright buys.
-    """
-    costs = cfg.get("costs", {})
-    qty   = lot_size * lots
-
-    # Turnover per side
-    buy_turnover  = entry_premium * qty * n_legs / 2
-    sell_turnover = exit_premium  * qty * n_legs / 2
-
-    brokerage = costs["brokerage_per_order"] * 2 * n_legs  # entry + exit per leg
-
-    stt = sell_turnover * costs["stt_sell_options_pct"] / 100
-
-    exchange = (buy_turnover + sell_turnover) * costs["exchange_txn_options_pct"] / 100
-
-    gst = (brokerage + exchange) * costs["gst_pct"] / 100
-
-    sebi = (buy_turnover + sell_turnover) * costs["sebi_turnover_pct"] / 100
-
-    stamp = buy_turnover * costs["stamp_duty_buy_pct"] / 100
-
-    total = brokerage + stt + exchange + gst + sebi + stamp
-    return round(total, 2)
-
-
-def calc_slippage(premium: float, ticks: int = 1) -> float:
-    """
-    Slippage in rupees per unit. 1 tick = ₹0.05 for options < ₹100, ₹0.10 for ≥ ₹100.
-    Applied on both entry and exit.
-    """
-    tick_size = 0.05 if premium < 100 else 0.10
-    return ticks * tick_size
 
 
 class Backtester:
@@ -140,18 +97,29 @@ class Backtester:
             raise ValueError(f"No clean data for {symbol} {start}→{end}")
 
         inst_cfg  = self.cfg["instruments"][symbol]
-        atm_step  = inst_cfg["atm_step"]
+        inst_key  = inst_cfg["upstox_key"]
         lot_size  = inst_cfg["lot_size"]
+        exchange  = inst_cfg.get("exchange", "NSE")
         bt_cfg    = self.cfg.get("backtest", {})
         tc_cfg    = self.cfg.get("trading", {})
         skip_exp  = tc_cfg.get("skip_expiry_day", True)
+        skip_evt  = tc_cfg.get("skip_event_days", True)
         use_real  = bt_cfg.get("use_real_option_data", True)
-        slippage  = self.cfg["costs"].get("slippage_ticks", 1)
+        bs_ok     = bt_cfg.get("bs_fallback_when_missing", True)
         lookback  = self.cfg["kronos"]["lookback"]
 
-        trade_records = []
+        no_open  = dtime(9, 15 + tc_cfg.get("no_trade_open_mins", 5))
+        sq_off_t = dtime(*[int(x) for x in tc_cfg.get("square_off_time", "15:15").split(":")])
+
+        # Real expiry dates — used both to pick the contract and to detect
+        # expiry days (exchanges moved expiry weekdays during 2024-2025).
+        expiries = sorted(self.broker.get_expired_expiries(inst_key) or [])
+        if not expiries:
+            logger.warning("%s: broker returned no expired expiries; option pricing will fail", symbol)
+
+        trade_records: list[dict] = []
         equity = 0.0
-        equity_series = {}
+        equity_series: dict = {}
         open_trade: Optional[dict] = None
         bar_count = 0
 
@@ -160,35 +128,25 @@ class Backtester:
         for d in dates:
             date_str = d.strftime("%Y-%m-%d")
 
-            # Skip expiry days
-            if skip_exp and is_expiry_day(d, symbol, self.cfg):
+            if skip_exp and is_expiry_day(d, symbol, self.cfg, expiries):
                 logger.info("Skipping expiry day: %s %s", symbol, date_str)
+                continue
+            if skip_evt and is_event_day(d, self.cfg):
+                logger.info("Skipping event day: %s %s", symbol, date_str)
                 continue
 
             day_bars = df[df.index.date == d]
             if len(day_bars) < 2:
                 continue
 
-            # Track daily P&L for kill-switch (live trading only — log here for reference)
-            daily_pnl = 0.0
-
-            for i, (ts, bar) in enumerate(day_bars.iterrows()):
+            for ts, bar in day_bars.iterrows():
                 bar_count += 1
-
-                # No trade in first/last N minutes
                 t = ts.time()
-                from datetime import time as dtime
-                no_open  = dtime(9, 15 + tc_cfg.get("no_trade_open_mins", 5))
-                sq_off_t = dtime(*[int(x) for x in tc_cfg.get("square_off_time", "15:15").split(":")])
 
                 # Square off open position at EOD
                 if open_trade and t >= sq_off_t:
-                    rec = self._close_trade(
-                        open_trade, symbol, date_str, str(ts.time())[:5],
-                        lot_size, lots, slippage, use_real, "SQUARE_OFF"
-                    )
+                    rec = self._close_trade(open_trade, ts, df, lot_size, lots, exchange, "SQUARE_OFF")
                     if rec:
-                        daily_pnl += rec["net_pnl_rs"]
                         equity += rec["net_pnl_rs"]
                         equity_series[ts] = equity
                         trade_records.append(rec)
@@ -198,10 +156,11 @@ class Backtester:
                 if (
                     open_trade is None
                     and bar_count % signal_bar_interval == 0
-                    and t >= no_open
-                    and t < sq_off_t
+                    and no_open <= t < sq_off_t
                 ):
-                    # Build input: all bars up to (not including) current
+                    # Input: all bars up to (not including) the current one.
+                    # Bars are labelled by their start, so the bar at `ts` is
+                    # still forming at `ts` and must not be seen.
                     idx_pos = df.index.get_loc(ts)
                     hist = df.iloc[max(0, idx_pos - lookback): idx_pos]
                     if len(hist) < 20:
@@ -217,43 +176,52 @@ class Backtester:
                     if signal["signal"] == "NEUTRAL":
                         continue
 
-                    # Get nearest expiry
-                    inst_key = inst_cfg["upstox_key"]
-                    expiry = self._get_nearest_expiry(inst_key, date_str)
+                    expiry = next((e for e in expiries if e >= date_str), None)
                     if not expiry:
                         continue
 
                     recommendation = self.mapper.map(
                         {**signal, "symbol": symbol},
                         expiry=expiry,
+                        option_chain=pd.DataFrame(),  # no live chain for a past date
                     )
                     if recommendation.get("strategy") == "NO_TRADE" or not recommendation.get("legs"):
                         continue
 
-                    # Open the trade
+                    entry = self._price_legs(
+                        symbol, recommendation["legs"], ts, expiry, df, use_real, bs_ok, source=None,
+                    )
+                    if entry is None:
+                        logger.debug("No entry prices for %s %s @ %s — skipped", symbol,
+                                     recommendation["strategy"], ts)
+                        continue
+                    leg_prices, source = entry
+
                     open_trade = {
                         "recommendation": recommendation,
-                        "entry_ts":       str(ts),
-                        "entry_bar":      bar,
+                        "entry_ts":       ts,
                         "signal":         signal,
                         "expiry":         expiry,
+                        "entry_prices":   leg_prices,   # [(price, contract_lot_size)]
+                        "data_source":    source,
                     }
-                    logger.debug("Opened %s %s @ %s", symbol, recommendation["strategy"], ts)
+                    logger.debug("Opened %s %s @ %s (%s)", symbol, recommendation["strategy"], ts, source)
 
-        # Close any still-open trade at end of test period
-        if open_trade:
-            rec = self._close_trade(
-                open_trade, symbol, dates[-1].strftime("%Y-%m-%d"), "15:15",
-                lot_size, lots, slippage, use_real, "PERIOD_END"
-            )
-            if rec:
-                equity += rec["net_pnl_rs"]
-                trade_records.append(rec)
+            # Session ended before square-off time (half day / missing bars):
+            # intraday positions never carry overnight.
+            if open_trade:
+                last_ts = day_bars.index[-1]
+                rec = self._close_trade(open_trade, last_ts, df, lot_size, lots, exchange, "SESSION_END")
+                if rec:
+                    equity += rec["net_pnl_rs"]
+                    equity_series[last_ts] = equity
+                    trade_records.append(rec)
+                open_trade = None
 
         trade_log = pd.DataFrame(trade_records) if trade_records else pd.DataFrame()
-        equity_curve = pd.Series(equity_series, name="equity_rs")
+        equity_curve = pd.Series(equity_series, name="equity_rs", dtype=float)
 
-        stats = self._compute_stats(trade_log, equity_curve)
+        stats = self._compute_stats(trade_log, dates)
 
         logger.info(
             "Backtest complete: %d trades | P&L=₹%.0f | Win=%.1f%% | Sharpe=%.2f",
@@ -261,7 +229,6 @@ class Backtester:
             stats["win_rate_pct"], stats["sharpe"],
         )
 
-        # Save to DB
         self._save_run(symbol, start, end, stats, trade_log)
 
         return {
@@ -270,143 +237,161 @@ class Backtester:
             "stats":        stats,
         }
 
+    # ── Pricing ────────────────────────────────────────────────────────
+
+    def _price_legs(
+        self,
+        symbol: str,
+        legs: list[dict],
+        ts: pd.Timestamp,
+        expiry: str,
+        df: pd.DataFrame,
+        use_real: bool,
+        bs_ok: bool,
+        source: Optional[str],
+    ) -> Optional[tuple[list[tuple[float, int]], str]]:
+        """
+        Price all legs at ts. Returns ([(price, lot_size)], source) or None.
+
+        source=None: try real data first, then BS (entry).
+        source given: price with that same source (exit), so a trade is never
+        opened on real prices and closed on model prices or vice versa.
+        """
+        date_str = ts.strftime("%Y-%m-%d")
+        time_str = ts.strftime("%H:%M")
+
+        if use_real and source in (None, "real_option_data"):
+            prices = []
+            for leg in legs:
+                got = self.fetcher.get_option_price_at(
+                    symbol, date_str, leg["strike"], leg["option_type"], time_str, expiry,
+                )
+                if got is None:
+                    prices = None
+                    break
+                prices.append(got)
+            if prices is not None:
+                return prices, "real_option_data"
+            if source == "real_option_data":
+                # A real-priced trade with no candle at or before the exit
+                # minute: drop it rather than close it on model prices.
+                return None
+
+        if not bs_ok or source not in (None, "bs_approximation"):
+            return None
+        spot = self._spot_at(df, ts)
+        if spot is None:
+            return None
+        prices = []
+        for leg in legs:
+            p = self._bs_price(symbol, spot, leg["strike"], leg["option_type"], ts, expiry)
+            prices.append((p, 0))
+        return prices, "bs_approximation"
+
+    @staticmethod
+    def _spot_at(df: pd.DataFrame, ts: pd.Timestamp) -> Optional[float]:
+        """Index level known at ts: close of the last completed bar before ts."""
+        prior = df[df.index < ts]
+        if prior.empty:
+            return None
+        return float(prior["close"].iloc[-1])
+
+    def _bs_price(self, symbol, spot, strike, opt_type, ts: pd.Timestamp, expiry: str) -> float:
+        """
+        Black-Scholes estimate. CAUTION: a flat assumed IV ignores skew and
+        intraday IV moves — filter 'bs_approximation' trades from any serious
+        performance analysis.
+        """
+        from scipy.stats import norm
+
+        iv = self.cfg["backtest"].get("iv_assumption_pct", 15.0) / 100
+        r = 0.065  # approx. Indian risk-free rate
+        exp_ts = IST.localize(datetime.strptime(expiry + " 15:30", "%Y-%m-%d %H:%M"))
+        # Time to expiry in years, measured to the minute so intraday theta shows up.
+        T = max((exp_ts - ts).total_seconds(), 60) / (365 * 24 * 3600)
+        S, K = spot, float(strike)
+
+        d1 = (math.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * math.sqrt(T))
+        d2 = d1 - iv * math.sqrt(T)
+        if opt_type == "CE":
+            price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+        else:
+            price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        return round(max(price, 0.05), 2)
+
     # ── Trade close helper ─────────────────────────────────────────────
 
     def _close_trade(
         self,
         open_trade: dict,
-        symbol: str,
-        date_str: str,
-        time_str: str,
+        exit_ts: pd.Timestamp,
+        df: pd.DataFrame,
         lot_size: int,
         lots: int,
-        slippage_ticks: int,
-        use_real: bool,
+        exchange: str,
         exit_reason: str,
     ) -> Optional[dict]:
-        rec   = open_trade["recommendation"]
-        legs  = rec["legs"]
-        exp   = open_trade["expiry"]
+        rec  = open_trade["recommendation"]
+        legs = rec["legs"]
+        exp  = open_trade["expiry"]
+        bt_cfg = self.cfg.get("backtest", {})
 
-        if not legs:
-            return None
-
-        # Use first leg as representative for price lookup
-        leg0     = legs[0]
-        strike   = leg0["strike"]
-        opt_type = leg0["option_type"]
-
-        entry_price, exit_price, data_source = self._get_option_prices(
-            symbol, date_str, time_str, strike, opt_type, exp, use_real
+        exit_ = self._price_legs(
+            rec["symbol"], legs, exit_ts, exp, df,
+            use_real=bt_cfg.get("use_real_option_data", True),
+            bs_ok=bt_cfg.get("bs_fallback_when_missing", True),
+            source=open_trade["data_source"],
         )
-
-        if entry_price is None:
-            logger.warning("No price data for %s %s %s%s — skipping", symbol, date_str, strike, opt_type)
+        if exit_ is None:
+            logger.warning("No exit prices for %s %s @ %s — trade dropped",
+                           rec["symbol"], rec["strategy"], exit_ts)
             return None
+        exit_prices, _ = exit_
 
-        # Direction: BUY leg = we profit if price goes up
-        direction_mult = 1 if leg0["action"] == "BUY" else -1
-        raw_pts  = (exit_price - entry_price) * direction_mult
-        raw_pnl  = raw_pts * lot_size * lots * len(legs)
+        priced_legs = []
+        for leg, (entry_p, entry_lot), (exit_p, _) in zip(legs, open_trade["entry_prices"], exit_prices):
+            priced_legs.append({
+                "action":      leg["action"],
+                "lots":        lots,
+                "lot_size":    entry_lot or lot_size,   # contract's own lot size if known
+                "entry_price": entry_p,
+                "exit_price":  exit_p,
+            })
+        result = trade_result(priced_legs, lot_size, self.cfg, exchange)
 
-        # Slippage (cost, always negative)
-        slip = calc_slippage(entry_price, slippage_ticks) * lot_size * lots * len(legs) * 2
-        charges = calc_charges(entry_price, exit_price, lot_size, lots, len(legs), self.cfg)
-        net_pnl = raw_pnl - slip - charges
+        # Net premium per unit (debit positive), for the trade log.
+        def net(side: str) -> float:
+            return sum((p[f"{side}_price"] if p["action"] == "BUY" else -p[f"{side}_price"])
+                       for p in priced_legs)
 
+        leg0 = legs[0]
         return {
-            "trade_date":    date_str,
-            "symbol":        symbol,
+            "trade_date":    exit_ts.strftime("%Y-%m-%d"),
+            "entry_time":    open_trade["entry_ts"].strftime("%H:%M"),
+            "exit_time":     exit_ts.strftime("%H:%M"),
+            "symbol":        rec["symbol"],
             "signal":        open_trade["signal"]["signal"],
             "strategy":      rec["strategy"],
-            "strike":        strike,
-            "option_type":   opt_type,
+            "strike":        leg0["strike"],
+            "option_type":   leg0["option_type"],
+            "legs":          " ".join(f"{l['action'][0]}{l['strike']}{l['option_type']}" for l in legs),
             "expiry":        exp,
-            "entry_price":   entry_price,
-            "exit_price":    exit_price,
+            "entry_price":   round(net("entry"), 2),
+            "exit_price":    round(net("exit"), 2),
             "lots":          lots,
-            "lot_size":      lot_size,
-            "raw_pnl_rs":    round(raw_pnl, 2),
-            "charges_rs":    round(charges + slip, 2),
-            "net_pnl_rs":    round(net_pnl, 2),
+            "lot_size":      priced_legs[0]["lot_size"],
+            **result,
             "sl_tgt_tag":    exit_reason,
-            "data_source":   data_source,
+            "data_source":   open_trade["data_source"],
         }
-
-    def _get_option_prices(
-        self, symbol, date_str, time_str, strike, opt_type, expiry, use_real
-    ):
-        """Return (entry_price, exit_price, data_source)."""
-        if use_real:
-            candle = self.fetcher.get_option_candle_at(
-                symbol, date_str, strike, opt_type, time_str, expiry
-            )
-            if candle:
-                # Use open as entry, close as exit (1-min candle)
-                return candle["open"], candle["close"], "real_option_data"
-
-        # Black-Scholes fallback
-        logger.debug("Using BS fallback for %s %s %s%s", symbol, date_str, strike, opt_type)
-        entry, exit_ = self._bs_approximate(symbol, date_str, strike, opt_type, expiry)
-        return entry, exit_, "bs_approximation"
-
-    def _bs_approximate(self, symbol, date_str, strike, opt_type, expiry):
-        """
-        Black-Scholes approximation when real option data is unavailable.
-        CAUTION: This is a rough estimate. Filter trades tagged 'bs_approximation'
-        from performance analysis or treat separately.
-        Uses spot price from index data and assumed IV from config.
-        """
-        from scipy.stats import norm
-        import math
-
-        iv = self.cfg["backtest"].get("iv_assumption_pct", 15.0) / 100
-        inst_key = self.cfg["instruments"][symbol]["upstox_key"]
-
-        try:
-            spot_df = self.fetcher.fetch_date_range(symbol, date_str, date_str, "5min", use_cache=True)
-            if spot_df.empty:
-                return None, None
-            spot = float(spot_df["close"].iloc[0])
-        except Exception:
-            return None, None
-
-        # Days to expiry
-        exp_dt  = datetime.strptime(expiry, "%Y-%m-%d")
-        bar_dt  = datetime.strptime(date_str, "%Y-%m-%d")
-        dte     = max((exp_dt - bar_dt).days, 1)
-        T       = dte / 365
-        r       = 0.065  # risk-free rate approx (India RBI repo ~6.5%)
-        S, K    = spot, float(strike)
-
-        d1 = (math.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * math.sqrt(T))
-        d2 = d1 - iv * math.sqrt(T)
-
-        if opt_type == "CE":
-            price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
-        else:
-            price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
-        price = max(price, 0.05)
-        return round(price, 2), round(price * 0.97, 2)  # crude 3% exit slippage
-
-    # ── Expiry helper ──────────────────────────────────────────────────
-
-    def _get_nearest_expiry(self, instrument_key: str, date_str: str) -> Optional[str]:
-        try:
-            expiries = self.broker.get_expired_expiries(instrument_key)
-            valid = [e for e in expiries if e >= date_str]
-            return sorted(valid)[0] if valid else None
-        except Exception as e:
-            logger.warning("Could not fetch expiries: %s", e)
-            return None
 
     # ── Performance stats ──────────────────────────────────────────────
 
     @staticmethod
-    def _compute_stats(trade_log: pd.DataFrame, equity_curve: pd.Series) -> dict:
+    def _compute_stats(trade_log: pd.DataFrame, dates: list) -> dict:
         if trade_log.empty:
-            return {"total_trades": 0, "total_pnl_rs": 0, "win_rate_pct": 0,
+            return {"total_trades": 0, "wins": 0, "losses": 0, "total_pnl_rs": 0,
+                    "win_rate_pct": 0, "avg_win_rs": 0, "avg_loss_rs": 0,
                     "sharpe": 0, "max_drawdown_rs": 0, "profit_factor": 0}
 
         pnls = trade_log["net_pnl_rs"]
@@ -416,21 +401,16 @@ class Backtester:
         win_rate = len(wins) / total_trades * 100 if total_trades else 0
         profit_factor = abs(wins.sum() / losses.sum()) if losses.sum() != 0 else float("inf")
 
-        # Sharpe (daily, annualised)
-        if len(equity_curve) > 1:
-            daily_returns = equity_curve.resample("D").last().diff().dropna()
-            sharpe = (daily_returns.mean() / daily_returns.std() * (252 ** 0.5)
-                      if daily_returns.std() != 0 else 0)
-        else:
-            sharpe = 0
+        # Daily P&L over EVERY session in the test (0 on days without a
+        # trade) — dropping flat days would inflate the Sharpe ratio.
+        all_days = pd.Index([d.strftime("%Y-%m-%d") for d in dates])
+        daily = trade_log.groupby("trade_date")["net_pnl_rs"].sum().reindex(all_days, fill_value=0.0)
+        std = daily.std()
+        sharpe = float(daily.mean() / std * np.sqrt(252)) if std and not np.isnan(std) else 0.0
 
-        # Max drawdown
-        if not equity_curve.empty:
-            roll_max = equity_curve.cummax()
-            drawdown = equity_curve - roll_max
-            max_dd = float(drawdown.min())
-        else:
-            max_dd = 0
+        # Max drawdown from a zero starting equity
+        equity = pd.concat([pd.Series([0.0]), pnls.cumsum()], ignore_index=True)
+        max_dd = float((equity - equity.cummax()).min())
 
         return {
             "total_trades":   total_trades,
@@ -441,12 +421,11 @@ class Backtester:
             "avg_win_rs":     round(float(wins.mean()), 2) if len(wins) else 0,
             "avg_loss_rs":    round(float(losses.mean()), 2) if len(losses) else 0,
             "profit_factor":  round(profit_factor, 3),
-            "sharpe":         round(float(sharpe), 3),
+            "sharpe":         round(sharpe, 3),
             "max_drawdown_rs": round(max_dd, 2),
         }
 
     def _save_run(self, symbol, start, end, stats, trade_log):
-        import json
         with get_conn(self.db_path) as conn:
             cur = conn.execute(
                 """INSERT INTO backtest_runs
@@ -454,11 +433,13 @@ class Backtester:
                     total_pnl_rs, sharpe, max_drawdown_rs, win_rate_pct, profit_factor, params)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    datetime.now().isoformat(), symbol, start, end,
+                    datetime.now(IST).isoformat(), symbol, start, end,
                     stats["total_trades"], stats.get("wins", 0), stats.get("losses", 0),
                     stats["total_pnl_rs"], stats["sharpe"], stats["max_drawdown_rs"],
                     stats["win_rate_pct"], stats["profit_factor"],
-                    json.dumps(self.cfg.get("signal", {})),
+                    json.dumps({"signal": self.cfg.get("signal", {}),
+                                "kronos": self.cfg.get("kronos", {}),
+                                "costs": self.cfg.get("costs", {})}),
                 ),
             )
             run_id = cur.lastrowid
@@ -473,10 +454,15 @@ class Backtester:
                         (
                             run_id, row.get("trade_date"), symbol,
                             row.get("signal"), row.get("strategy"),
-                            row.get("strike"), row.get("option_type"), row.get("expiry"),
-                            row.get("entry_price"), row.get("exit_price"),
-                            row.get("lots"), row.get("lot_size"),
-                            row.get("raw_pnl_rs"), row.get("charges_rs"), row.get("net_pnl_rs"),
+                            _py(row.get("strike")), row.get("option_type"), row.get("expiry"),
+                            _py(row.get("entry_price")), _py(row.get("exit_price")),
+                            _py(row.get("lots")), _py(row.get("lot_size")),
+                            _py(row.get("raw_pnl_rs")), _py(row.get("charges_rs")), _py(row.get("net_pnl_rs")),
                             row.get("sl_tgt_tag"), row.get("data_source"),
                         ),
                     )
+
+
+def _py(v):
+    """numpy scalar -> Python scalar (sqlite3 rejects numpy.int64)."""
+    return v.item() if hasattr(v, "item") else v

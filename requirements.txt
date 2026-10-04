@@ -2,7 +2,7 @@
 #  Kronos Options Signal System — Python Dependencies
 #  Python 3.10+ required. Install: pip install -r requirements.txt
 #
-#  Kronos AI model — separate one-time setup:
+#  Kronos AI model — separate one-time setup (brings in torch etc.):
 #    git clone https://github.com/shiyu-coder/Kronos <your-path>
 #    cd <your-path> && pip install -r requirements.txt
 #    Set KRONOS_REPO_PATH=<your-path> in .env
@@ -13,48 +13,22 @@
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0          # Black-Scholes fallback for options pricing
+pytz>=2023.3
 
-# ── Broker APIs ───────────────────────────────────────────────────────
+# ── Broker API + config ───────────────────────────────────────────────
 requests>=2.31.0        # Upstox REST API
-kiteconnect>=4.1.0      # Zerodha (stub implementation — swap when needed)
 python-dotenv>=1.0.0    # Load .env credentials safely
-
-# ── Configuration ─────────────────────────────────────────────────────
 pyyaml>=6.0.0
 
-# ── Visualisation ─────────────────────────────────────────────────────
-matplotlib>=3.7.0
+# ── Dashboard ─────────────────────────────────────────────────────────
 plotly>=5.15.0
 streamlit>=1.28.0
 
-# ── Database ──────────────────────────────────────────────────────────
-# SQLite is built into Python — no extra package needed.
-# Using standard library sqlite3.
-
-# ── Notifications ─────────────────────────────────────────────────────
-plyer>=2.1.0            # Cross-platform desktop notifications
-
-# ── Timezone ──────────────────────────────────────────────────────────
-pytz>=2023.3
-
-# ── Terminal output ───────────────────────────────────────────────────
-colorama>=0.4.6         # Coloured terminal output (cross-platform Windows fix)
-tabulate>=0.9.0         # Pretty-print tables in CLI
-
-# ── Scheduling ────────────────────────────────────────────────────────
-schedule>=1.2.0         # Lightweight job scheduler for paper_trader loop
-APScheduler>=3.10.0     # Alternative — used if schedule isn't precise enough
+# ── Notifications (optional; silently skipped if missing) ─────────────
+plyer>=2.1.0
 
 # ── Testing ───────────────────────────────────────────────────────────
 pytest>=7.4.0
-pytest-mock>=3.11.0
 
-# ── Notebooks ─────────────────────────────────────────────────────────
-jupyter>=1.0.0
-notebook>=7.0.0
-ipykernel>=6.25.0
-ipywidgets>=8.0.0
-
-# ── Utilities ─────────────────────────────────────────────────────────
-tqdm>=4.65.0            # Progress bars for backtest loops
-tenacity>=8.2.0         # Retry logic with exponential backoff for API calls
+# ── Optional: Zerodha stub only ───────────────────────────────────────
+# kiteconnect>=4.1.0

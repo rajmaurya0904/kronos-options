@@ -25,6 +25,26 @@ class BrokerInterface(ABC):
         """Return OHLCV DataFrame with DatetimeIndex (IST, tz-aware)."""
         ...
 
+    def get_intraday_candles(self, instrument_key: str, interval: str = "1minute") -> pd.DataFrame:
+        """Today's candles so far (IST, tz-aware index)."""
+        raise NotImplementedError
+
+    def get_expiries(self, instrument_key: str) -> list[str]:
+        """Current and future expiry dates 'YYYY-MM-DD', ascending."""
+        raise NotImplementedError
+
+    def get_option_contract(
+        self, instrument_key: str, expiry: str, strike: int, option_type: str,
+    ) -> Optional[dict]:
+        """Listed (unexpired) contract dict incl. 'instrument_key' and 'lot_size'."""
+        raise NotImplementedError
+
+    def get_expired_option_contract(
+        self, instrument_key: str, expiry: str, strike: int, option_type: str,
+    ) -> Optional[dict]:
+        """Expired contract dict incl. 'instrument_key' and 'lot_size'."""
+        raise NotImplementedError
+
     @abstractmethod
     def get_expired_expiries(self, instrument_key: str) -> list[str]:
         """Return sorted list of past expiry dates as 'YYYY-MM-DD' strings."""

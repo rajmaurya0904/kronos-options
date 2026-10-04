@@ -49,13 +49,15 @@ class OptionsMapper:
         Args:
             signal:       Output of SignalEngine.generate()
             expiry:       Target expiry date "YYYY-MM-DD"
-            option_chain: Live option chain DataFrame (fetched if not provided)
+            option_chain: Live option chain DataFrame. None = fetch it now;
+                          an empty DataFrame = don't (the backtester passes one,
+                          since a live chain says nothing about a past date).
 
         Returns recommendation dict with:
             strategy, legs (list of {strike, option_type, action, lots, ltp}),
             lot_size, max_profit_rs, max_loss_rs, breakeven_upper, breakeven_lower
         """
-        symbol = signal["signal_name"] if "signal_name" in signal else signal.get("symbol", "")
+        symbol = signal["symbol"]
         sig    = signal["signal"]
         dispersion_regime = signal.get("dispersion_regime", "medium")
         iv_regime         = signal.get("iv_regime", None)
@@ -70,8 +72,8 @@ class OptionsMapper:
 
         atm_strike = round_to_atm(current_close, atm_step)
 
-        # Fetch option chain if not provided
-        if option_chain is None or option_chain.empty:
+        # Fetch option chain only if the caller didn't pass one
+        if option_chain is None:
             try:
                 option_chain = self.broker.get_option_chain(inst_key, expiry)
             except Exception as e:
@@ -155,8 +157,19 @@ class OptionsMapper:
             col = f"{opt_type}_ltp"
             row = option_chain[option_chain["strike"] == strike]
             if not row.empty and col in row.columns:
-                return float(row[col].iloc[0]) or 0.0
+                val = row[col].iloc[0]
+                return float(val) if pd.notna(val) else 0.0
             return 0.0
+
+        def get_key(strike: int, opt_type: str):
+            """Tradable instrument key from the chain (needed for live orders)."""
+            col = f"{opt_type}_key"
+            if option_chain.empty or col not in option_chain.columns:
+                return None
+            row = option_chain[option_chain["strike"] == strike]
+            if row.empty or pd.isna(row[col].iloc[0]):
+                return None
+            return row[col].iloc[0]
 
         builders = {
             "buy_atm_ce": lambda: [
@@ -213,7 +226,10 @@ class OptionsMapper:
         if builder is None:
             logger.error("Unknown strategy: %s", strategy)
             return []
-        return builder()
+        legs = builder()
+        for leg in legs:
+            leg["instrument_key"] = get_key(leg["strike"], leg["option_type"])
+        return legs
 
     # ── Risk/reward calculation ─────────────────────────────────────────
 

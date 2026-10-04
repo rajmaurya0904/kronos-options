@@ -2,7 +2,7 @@
 Paper trader — live loop that runs during market hours.
 
 Every 5 minutes:
-  1. Fetch latest bars for all enabled instruments.
+  1. Fetch latest bars (history + today's intraday) for all enabled instruments.
   2. Run Kronos forecast → signal → option recommendation.
   3. Log simulated trade to SQLite (no real orders placed).
   4. Send desktop notification on new signal.
@@ -18,20 +18,25 @@ import argparse
 import json
 import logging
 import time
-from datetime import datetime, date
+from datetime import datetime, time as dtime
 
 import pandas as pd
 
 from src.broker.base import BrokerInterface
+from src.costs import trade_result
 from src.data_fetcher import DataFetcher
 from src.data_cleaner import clean, is_expiry_day
 from src.forecaster import KronosForecaster
 from src.signal_engine import SignalEngine
 from src.options_mapper import OptionsMapper
-from src.utils import get_broker, load_config, now_ist, is_market_open, IST
-from src.db import init_db, save_signal, get_conn, get_paper_trades
+from src.utils import get_broker, load_config, now_ist, is_market_open, is_event_day
+from src.db import init_db, get_conn
 
 logger = logging.getLogger(__name__)
+
+# Seconds to wait past each 5-min boundary so the just-closed bar has been
+# published by the intraday candle endpoint before we read it.
+BAR_SETTLE_S = 10
 
 
 def notify(title: str, message: str) -> None:
@@ -65,12 +70,30 @@ class PaperTrader:
         pt_cfg = self.cfg.get("paper_trading", {})
         self.max_open  = pt_cfg.get("max_open_positions", 3)
         self.lots      = pt_cfg.get("lots", 1)
+        self.notify_on = pt_cfg.get("notify_on_signal", True)
 
         tc = self.cfg.get("trading", {})
-        self.sq_off_h, self.sq_off_m = [int(x) for x in tc.get("square_off_time", "15:15").split(":")]
-        self.no_trade_open = tc.get("no_trade_open_mins", 5)
+        sq_h, sq_m = [int(x) for x in tc.get("square_off_time", "15:15").split(":")]
+        self.sq_off_time    = dtime(sq_h, sq_m)
+        self.no_trade_until = dtime(9, 15 + tc.get("no_trade_open_mins", 5))
 
         self._open_positions: dict[str, dict] = {}  # symbol → trade rec
+        self._expiry_cache: dict[str, tuple] = {}   # symbol → (date, [expiries])
+
+        self._abandon_stale_rows()
+
+    def _abandon_stale_rows(self) -> None:
+        """
+        Open positions live in memory only, so after a restart any row still
+        marked OPEN can never be closed. Mark them so P&L pages don't show
+        phantom positions forever.
+        """
+        with get_conn(self.db_path) as conn:
+            n = conn.execute(
+                "UPDATE paper_trades SET status='ABANDONED', exit_reason='RESTART' WHERE status='OPEN'"
+            ).rowcount
+        if n:
+            logger.warning("Marked %d OPEN paper trade(s) from a previous run as ABANDONED.", n)
 
     # ── Main loop ─────────────────────────────────────────────────────
 
@@ -81,9 +104,8 @@ class PaperTrader:
             now = now_ist()
 
             if not is_market_open(now):
-                next_check = 60
-                logger.debug("Market closed. Sleeping %ds.", next_check)
-                time.sleep(next_check)
+                logger.debug("Market closed. Sleeping 60s.")
+                time.sleep(60)
                 continue
 
             try:
@@ -91,44 +113,61 @@ class PaperTrader:
             except Exception as e:
                 logger.error("Tick error: %s", e, exc_info=True)
 
-            # Sleep until next 5-min bar boundary
+            # Sleep until just after the next 5-min bar boundary
+            now = now_ist()
             seconds_past = now.minute % 5 * 60 + now.second
-            sleep_for = max(5, 300 - seconds_past)
+            sleep_for = 300 - seconds_past + BAR_SETTLE_S
             logger.debug("Sleeping %ds until next bar.", sleep_for)
             time.sleep(sleep_for)
 
     def _tick(self, now: datetime) -> None:
         """Single processing tick: fetch → forecast → signal → log."""
         t = now.time()
-        from datetime import time as dtime
-        no_trade_until = dtime(9, 15 + self.no_trade_open)
-        sq_off_time    = dtime(self.sq_off_h, self.sq_off_m)
 
         # Square off all positions
-        if t >= sq_off_time:
+        if t >= self.sq_off_time:
             self._square_off_all(now)
             return
 
         # Mark open positions to market
         self._mark_to_market(now)
 
-        if t < no_trade_until:
-            logger.debug("Waiting for market to settle (before %s).", no_trade_until)
+        if t < self.no_trade_until:
+            logger.debug("Waiting for market to settle (before %s).", self.no_trade_until)
+            return
+
+        if self.cfg["trading"].get("skip_event_days", True) and is_event_day(now.date(), self.cfg):
+            logger.info("Event day in config — no new trades today.")
             return
 
         # Process each symbol
-        open_count = len(self._open_positions)
         for symbol in self.symbols:
-            if open_count >= self.max_open:
+            if len(self._open_positions) >= self.max_open:
                 break
             if symbol in self._open_positions:
                 continue
-            if is_expiry_day(now.date(), symbol, self.cfg) and self.cfg["trading"].get("skip_expiry_day", True):
+            expiries = self._expiries(symbol, now)
+            if (self.cfg["trading"].get("skip_expiry_day", True)
+                    and is_expiry_day(now.date(), symbol, self.cfg, expiries)):
                 logger.info("Skipping %s — expiry day.", symbol)
                 continue
 
             self._process_symbol(symbol, now)
-            open_count = len(self._open_positions)
+
+    def _expiries(self, symbol: str, now: datetime) -> list[str]:
+        """Current/future expiries, fetched once per day per symbol."""
+        cached = self._expiry_cache.get(symbol)
+        if cached and cached[0] == now.date():
+            return cached[1]
+        inst_key = self.cfg["instruments"][symbol]["upstox_key"]
+        try:
+            expiries = self.broker.get_expiries(inst_key)
+        except Exception as e:
+            logger.error("%s: could not fetch expiries: %s", symbol, e)
+            expiries = []
+        if expiries:  # don't cache a failure for the whole day
+            self._expiry_cache[symbol] = (now.date(), expiries)
+        return expiries
 
     def _process_symbol(self, symbol: str, now: datetime) -> None:
         """Fetch → forecast → signal → map → log for one symbol."""
@@ -140,6 +179,9 @@ class PaperTrader:
             if len(df) < 20:
                 logger.warning("%s: not enough bars (%d).", symbol, len(df))
                 return
+            if df.index[-1].date() != now.date():
+                logger.warning("%s: no bars from today yet — not forecasting off yesterday.", symbol)
+                return
 
             forecast = self.forecaster.forecast(symbol, df)
             signal   = self.signal_eng.generate(forecast)
@@ -148,26 +190,33 @@ class PaperTrader:
                 logger.info("%s: NEUTRAL — no trade.", symbol)
                 return
 
-            # Get nearest weekly expiry
-            inst_key = self.cfg["instruments"][symbol]["upstox_key"]
-            expiries = self.broker.get_expired_expiries(inst_key)
+            # Nearest listed expiry (today's is excluded when we got here,
+            # since expiry days are skipped above)
             today_str = now.strftime("%Y-%m-%d")
-            valid = [e for e in expiries if e >= today_str]
-            if not valid:
+            expiry = next((e for e in self._expiries(symbol, now) if e >= today_str), None)
+            if not expiry:
                 logger.warning("%s: no valid expiry found.", symbol)
                 return
-            expiry = sorted(valid)[0]
 
             # Get live option chain
+            inst_key = self.cfg["instruments"][symbol]["upstox_key"]
             try:
                 chain = self.broker.get_option_chain(inst_key, expiry)
             except Exception:
                 chain = pd.DataFrame()
+            if chain.empty:
+                logger.warning("%s: empty option chain for %s — no trade.", symbol, expiry)
+                return
 
             signal["symbol"] = symbol
             rec = self.mapper.map(signal, expiry=expiry, option_chain=chain)
 
             if rec.get("strategy") == "NO_TRADE":
+                return
+            missing = [f"{l['strike']}{l['option_type']}" for l in rec["legs"] if not l.get("ltp")]
+            if missing:
+                # A zero entry price would turn into fake P&L at exit.
+                logger.warning("%s: no LTP for %s — no trade.", symbol, ", ".join(missing))
                 return
 
             self._open_paper_position(symbol, rec, signal, now)
@@ -177,38 +226,38 @@ class PaperTrader:
 
     # ── Position management ────────────────────────────────────────────
 
-    def _open_paper_position(self, symbol: str, rec: dict, signal: dict, now: datetime) -> None:
-        entry_premium = sum(
-            leg.get("ltp", 0) for leg in rec.get("legs", [])
-            if leg["action"] == "BUY"
-        ) - sum(
-            leg.get("ltp", 0) for leg in rec.get("legs", [])
-            if leg["action"] == "SELL"
-        )
+    @staticmethod
+    def _net_premium(legs: list[dict], prices: list[float]) -> float:
+        """Net premium per unit: debit positive, credit negative."""
+        return sum(p if l["action"] == "BUY" else -p for l, p in zip(legs, prices))
 
-        trade = {
+    def _open_paper_position(self, symbol: str, rec: dict, signal: dict, now: datetime) -> None:
+        legs = rec.get("legs", [])
+        entry_premium = self._net_premium(legs, [l["ltp"] for l in legs])
+
+        legs_json = json.dumps(legs)
+        with get_conn(self.db_path) as conn:
+            trade_id = conn.execute(
+                """INSERT INTO paper_trades
+                   (symbol, strategy, entry_time, status, legs, entry_total_premium)
+                   VALUES (?,?,?,?,?,?)""",
+                (symbol, rec["strategy"], now.isoformat(), "OPEN", legs_json, entry_premium),
+            ).lastrowid
+
+        self._open_positions[symbol] = {
             **rec,
+            "trade_id": trade_id,
             "entry_time": now.isoformat(),
             "entry_premium": entry_premium,
             "signal": signal["signal"],
             "confidence": signal["confidence"],
         }
-        self._open_positions[symbol] = trade
-
-        # Persist to DB
-        legs_json = json.dumps(rec.get("legs", []))
-        with get_conn(self.db_path) as conn:
-            conn.execute(
-                """INSERT INTO paper_trades
-                   (symbol, strategy, entry_time, status, legs, entry_total_premium)
-                   VALUES (?,?,?,?,?,?)""",
-                (symbol, rec["strategy"], now.isoformat(), "OPEN", legs_json, entry_premium),
-            )
 
         msg = (f"{rec['strategy']} | confidence={signal['confidence']:.2f} | "
                f"max_loss=₹{rec.get('max_loss_rs', 0):.0f}")
         logger.info("PAPER TRADE OPEN: %s %s", symbol, msg)
-        notify(f"New Signal: {symbol}", msg)
+        if self.notify_on:
+            notify(f"New Signal: {symbol}", msg)
 
     def _square_off_all(self, now: datetime) -> None:
         """Close all open positions at current prices."""
@@ -218,79 +267,73 @@ class PaperTrader:
         for symbol in list(self._open_positions.keys()):
             self._close_position(symbol, now, reason="SQUARE_OFF")
 
+    def _result(self, symbol: str, pos: dict, exit_prices: list[float]) -> dict:
+        inst = self.cfg["instruments"][symbol]
+        priced = [
+            {"action": l["action"], "lots": l.get("lots", 1),
+             "entry_price": l["ltp"], "exit_price": p}
+            for l, p in zip(pos["legs"], exit_prices)
+        ]
+        return trade_result(priced, inst["lot_size"], self.cfg, inst.get("exchange", "NSE"))
+
     def _close_position(self, symbol: str, now: datetime, reason: str = "SIGNAL_EXIT") -> None:
         pos = self._open_positions.pop(symbol, None)
         if not pos:
             return
 
-        inst_key = self.cfg["instruments"][symbol]["upstox_key"]
-        lot_size = self.cfg["instruments"][symbol]["lot_size"]
-        lots     = pos.get("lots", 1)
-        legs     = pos.get("legs", [])
-        n_legs   = len(legs)
-
-        exit_premium = self._fetch_legs_premium(symbol, inst_key, legs, pos["expiry"])
-
-        raw_pnl = (exit_premium - pos["entry_premium"]) * lot_size * lots * n_legs
-        charges = 20.0 * 2 * n_legs  # flat ₹20/order, entry + exit per leg
-        net_pnl = raw_pnl - charges
+        exit_prices = self._fetch_leg_ltps(symbol, pos["legs"], pos["expiry"])
+        exit_premium = self._net_premium(pos["legs"], exit_prices)
+        res = self._result(symbol, pos, exit_prices)
 
         logger.info("PAPER TRADE CLOSE: %s %s | exit_prem=%.2f | net_pnl=₹%.0f | reason=%s",
-                    symbol, pos["strategy"], exit_premium, net_pnl, reason)
+                    symbol, pos["strategy"], exit_premium, res["net_pnl_rs"], reason)
 
         with get_conn(self.db_path) as conn:
             conn.execute(
                 """UPDATE paper_trades SET
                    exit_time=?, status='CLOSED', exit_total_premium=?,
                    raw_pnl_rs=?, charges_rs=?, net_pnl_rs=?, exit_reason=?
-                   WHERE symbol=? AND status='OPEN'
-                   ORDER BY rowid DESC LIMIT 1""",
-                (now.isoformat(), exit_premium, raw_pnl, charges, net_pnl, reason, symbol),
+                   WHERE id=?""",
+                (now.isoformat(), exit_premium, res["raw_pnl_rs"], res["charges_rs"],
+                 res["net_pnl_rs"], reason, pos["trade_id"]),
             )
+        return res
 
-    def _fetch_legs_premium(
-        self,
-        symbol: str,
-        inst_key: str,
-        legs: list[dict],
-        expiry: str,
-    ) -> float:
+    def _fetch_leg_ltps(self, symbol: str, legs: list[dict], expiry: str) -> list[float]:
         """
-        Fetch live LTP for each option leg from the option chain.
-        Returns net premium (BUY legs positive, SELL legs negative).
-        Falls back to entry LTP if chain fetch fails.
+        Live LTP for each leg from the option chain, in leg order.
+        A leg with no live price keeps its entry price (logged), so a data
+        gap shows as zero P&L for that leg rather than a fake swing.
         """
+        inst_key = self.cfg["instruments"][symbol]["upstox_key"]
         try:
             chain = self.broker.get_option_chain(inst_key, expiry)
         except Exception:
             chain = pd.DataFrame()
 
-        net = 0.0
+        prices = []
         for leg in legs:
             col = f"{leg['option_type']}_ltp"
-            ltp = leg.get("ltp", 0.0)  # fallback to entry price
-            if not chain.empty:
+            ltp = None
+            if not chain.empty and col in chain.columns:
                 row = chain[chain["strike"] == leg["strike"]]
-                if not row.empty and col in row.columns:
-                    fetched = float(row[col].iloc[0] or 0.0)
-                    if fetched > 0:
-                        ltp = fetched
-            net += ltp if leg["action"] == "BUY" else -ltp
-        return net
+                if not row.empty and pd.notna(row[col].iloc[0]) and float(row[col].iloc[0]) > 0:
+                    ltp = float(row[col].iloc[0])
+            if ltp is None:
+                logger.warning("%s: no live price for %s%s — using entry price",
+                               symbol, leg["strike"], leg["option_type"])
+                ltp = leg["ltp"]
+            prices.append(ltp)
+        return prices
 
     def _mark_to_market(self, now: datetime) -> None:
         """Log current unrealised P&L for all open positions."""
         for symbol, pos in self._open_positions.items():
             try:
-                inst_key = self.cfg["instruments"][symbol]["upstox_key"]
-                lot_size = self.cfg["instruments"][symbol]["lot_size"]
-                lots     = pos.get("lots", 1)
-                legs     = pos.get("legs", [])
-                current_premium = self._fetch_legs_premium(
-                    symbol, inst_key, legs, pos["expiry"]
-                )
-                unrealised = (current_premium - pos["entry_premium"]) * lot_size * lots * len(legs)
-                logger.info("MTM %s %s: unrealised P&L = ₹%.0f", symbol, pos["strategy"], unrealised)
+                prices = self._fetch_leg_ltps(symbol, pos["legs"], pos["expiry"])
+                res = self._result(symbol, pos, prices)
+                logger.info("MTM %s %s: unrealised P&L = ₹%.0f (after costs)",
+                            symbol, pos["strategy"], res["net_pnl_rs"])
             except Exception as e:
                 logger.debug("MTM failed for %s: %s", symbol, e)
 

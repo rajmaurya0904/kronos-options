@@ -10,7 +10,7 @@ Handles:
 """
 from __future__ import annotations
 import logging
-from datetime import time as dtime
+from datetime import time as dtime, timedelta
 
 import pandas as pd
 
@@ -134,11 +134,26 @@ def get_session_bars(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
     return df[mask].copy()
 
 
-def is_expiry_day(d, symbol: str, config: dict) -> bool:
-    """Check if date d is weekly expiry for the given symbol."""
-    expiry_day_name = config["instruments"][symbol].get("expiry_day", "Thursday")
+def is_expiry_day(d, symbol: str, config: dict, expiries=None) -> bool:
+    """
+    Check if date d is an expiry day for the given symbol.
+
+    expiries: the broker's real expiry dates ("YYYY-MM-DD"). Prefer passing
+    them: they follow exchange changes (NIFTY moved Thursday -> Tuesday in
+    Sep-2025, BANKNIFTY weeklies ended Nov-2024) and holiday shifts.
+    Without them, falls back to config's expiry_day / expiry_cycle.
+    """
+    if expiries:
+        return d.strftime("%Y-%m-%d") in set(expiries)
+    inst = config["instruments"][symbol]
     day_map = {
         "Monday": 0, "Tuesday": 1, "Wednesday": 2,
         "Thursday": 3, "Friday": 4,
     }
-    return d.weekday() == day_map.get(expiry_day_name, 3)
+    wd = day_map.get(inst.get("expiry_day", "Tuesday"), 1)
+    if d.weekday() != wd:
+        return False
+    if inst.get("expiry_cycle", "weekly") == "monthly":
+        # Monthly contracts expire on the last such weekday of the month.
+        return (d + timedelta(days=7)).month != d.month
+    return True

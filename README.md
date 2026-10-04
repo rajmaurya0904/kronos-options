@@ -12,6 +12,7 @@ A candlestick foundation model forecasts NIFTY, BANKNIFTY and SENSEX. Those fore
 ![Runs on](https://img.shields.io/badge/runs%20on-CPU%20%C2%B7%208%20GB%20RAM-2EA043)
 ![Mode](https://img.shields.io/badge/default-paper%20trading-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![tests](https://github.com/rajmaurya0904/kronos-options/actions/workflows/tests.yml/badge.svg)](https://github.com/rajmaurya0904/kronos-options/actions/workflows/tests.yml)
 
 </div>
 
@@ -74,13 +75,13 @@ Every threshold and strategy choice lives in [`config.yaml`](config.yaml), so yo
 
 - 🧠 **Probabilistic forecasts.** Several sampled paths per bar, so you get a distribution and not a single guess.
 - 🎯 **Three instruments.** NIFTY, BANKNIFTY and SENSEX, each with its own lot size, strike step and expiry day.
-- 🧾 **Real option prices.** The backtester pulls actual historical option OHLC from Upstox's expired-instruments API. If a bar is missing it falls back to Black-Scholes and tags the trade `bs_approximation`, so you can filter those out.
-- 💸 **Honest costs.** Brokerage, STT, exchange charges, GST, SEBI fees, stamp duty and one tick of slippage per side.
-- 🛡️ **Risk rules built in.** No trades in the first 5 minutes, none after 15:15, a hard 15:15 square-off, skipped expiry days and an event blackout calendar.
+- 🧾 **Real option prices.** The backtester prices every leg at the real entry minute and the real exit minute from Upstox's expired-instruments 1-minute candles, using each contract's own lot size. If any leg has no data, the whole trade falls back to Black-Scholes and is tagged `bs_approximation`, so you can filter those out. A trade is never half real, half modelled.
+- 💸 **Honest costs.** Per leg, on actual buy and sell turnover: brokerage, STT (0.15% on sells since April 2026), exchange charges, GST, SEBI fees, stamp duty and one tick of slippage each way. The backtester and paper trader share one cost model.
+- 🛡️ **Risk rules built in.** No trades in the first 5 minutes, none after 15:15, a hard 15:15 square-off, skipped expiry days (read from the broker's real expiry list) and skipped event days from a configurable calendar.
 - 📊 **Streamlit dashboard** with four pages: Live Forecasts, Today's Signals, Paper P&L and Backtest Results.
 - 🔌 **Broker-agnostic.** Upstox is the primary broker, behind a small interface. A Zerodha stub is included.
-- 🔒 **Triple-locked live mode.** Off by default (see [Live trading safety](#-live-trading-safety)).
-- ✅ **Tested.** 19 unit tests cover the utilities, the data cleaner and the signal engine.
+- 🔒 **Four-lock live mode.** Off by default (see [Live trading safety](#-live-trading-safety)).
+- ✅ **Tested in CI.** Unit tests for the utilities, data cleaner, signal engine, expiry detection and cost model run on every push via GitHub Actions.
 
 ## Quick start
 
@@ -130,7 +131,7 @@ python run_backtest.py --symbol NIFTY --start 2026-05-01 --end 2026-06-09
 python run_backtest.py --symbol BANKNIFTY --start 2025-06-01 --end 2025-12-31 --lots 2
 ```
 
-It prints trades, win rate, total P&L, average win and loss, profit factor, Sharpe and max drawdown. It also warns you what share of trades fell back to Black-Scholes.
+It prints trades, win rate, total P&L, average win and loss, profit factor, Sharpe and max drawdown. It also warns you what share of trades fell back to Black-Scholes. Sharpe is computed over every session in the test, including days with no trade, so idle days are not dropped from the ratio.
 
 To keep only the trades priced from real option data:
 
@@ -144,7 +145,7 @@ real = result["trade_log"][result["trade_log"]["data_source"] == "real_option_da
 python -m src.paper_trader --symbols NIFTY BANKNIFTY
 ```
 
-It wakes on every 5-minute bar, forecasts, signals, maps and logs a paper trade. It marks open positions to market and squares everything off at 15:15. **No orders are ever sent.**
+It wakes just after every 5-minute bar closes, combines cached history with today's intraday candles, and only uses completed bars. Then it forecasts, signals, maps and logs a paper trade, but only when every leg has a live price. It marks open positions to market after costs and squares everything off at 15:15. **No orders are ever sent.**
 
 ### Open the dashboard
 
@@ -161,10 +162,10 @@ Then visit <http://localhost:8501>.
 | Model | `kronos.lookback: 400` bars in, `pred_len: 12` bars out (1 hour), `samples: 5`, `temperature: 1.0`, `top_p: 0.9` |
 | Session | `09:15–15:30` IST, no new trades after `15:15`, `skip_expiry_day: true` |
 | Sizing | `paper_trading.capital_per_trade: 50000`, `max_open_positions: 3` |
-| Instruments | NIFTY (lot 75, Thu expiry), BANKNIFTY (lot 15, Wed), SENSEX (lot 10, Fri) |
-| Costs | ₹20 per order, STT 0.05% on sell premium, 0.053% exchange charge, 18% GST, 1-tick slippage |
+| Instruments | NIFTY (lot 65, weekly Tue expiry), BANKNIFTY (lot 30, monthly last-Tue expiry), SENSEX (lot 20, weekly Thu expiry) |
+| Costs | ₹20 per order, STT 0.15% on sell premium, exchange charge 0.03553% (NSE) / 0.0325% (BSE), 18% GST, 1-tick slippage each way |
 
-Lot sizes and expiry days change. Check them against the exchange before trusting any result.
+Lot sizes and expiry days change. The backtester takes lot sizes from each historical contract and expiry days from the broker, so past periods are sized correctly. The values in `config.yaml` are used for live and paper trading, so keep them current.
 
 ## Project structure
 
@@ -190,11 +191,14 @@ kronos-options/
 
 ## 🔒 Live trading safety
 
-Live order placement exists but is **off by default**, and it takes three separate actions to turn on:
+Live order placement exists but is **off by default**, and it takes four separate actions to turn on:
 
 1. `LIVE_TRADING=true` in `.env`
 2. the `--live` flag on the command line
 3. typing `I CONFIRM LIVE TRADING` at the startup prompt
+4. `live_trading.enabled: true` in `config.yaml`
+
+Orders are intraday (MIS) market orders, sent only on resolved option contracts. Hedge legs are bought before short legs are sold, and shorts are bought back first on exit, so a naked short never exists. Every order must reach `complete`. If any leg fails, the filled legs are closed and the kill switch is engaged.
 
 On top of that, `config.yaml` sets hard limits: at most **3 trades a day**, **₹50,000 per trade**, and a **−₹5,000 daily loss kill-switch** that stops trading for the day.
 
@@ -204,6 +208,8 @@ Please run the backtest and paper trader for several weeks before even consideri
 
 - The Kronos wrapper follows the model repo's documented API. If upstream changes it, adjust `_run_kronos()` in `src/forecaster.py`.
 - Upstox access tokens expire daily, so you need a fresh one each morning.
+- Positions are held in memory. If the paper trader restarts mid-day, earlier open rows are marked `ABANDONED` instead of being left open forever.
+- Exits are time-based (square-off) only. There is no per-trade stop-loss or target yet.
 - SENSEX index volume is often zero (BSE methodology). It is flagged and not used as a feature.
 - The Black-Scholes fallback assumes 15% IV and a 6.5% risk-free rate, and is used only when real data is missing.
 - Upstox's expired-instruments history may not reach back far enough for older backtests.
@@ -213,7 +219,8 @@ Please run the backtest and paper trader for several weeks before even consideri
 
 - [ ] Publish a reference backtest with walk-forward splits
 - [ ] Automatic daily Upstox token refresh
-- [ ] Fetch lot sizes and expiry days from the broker at runtime
+- [x] Expiry days and historical lot sizes from the broker
+- [ ] Per-trade stop-loss and target exits
 - [ ] Complete the Zerodha broker implementation
 
 ## Acknowledgements

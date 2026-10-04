@@ -9,27 +9,30 @@ instruments:
     upstox_key: "NSE_INDEX|Nifty 50"
     zerodha_symbol: "NIFTY 50"
     atm_step: 50            # Strike rounding granularity
-    lot_size: 75            # Current lot size — verified 2026; fetch_lot_size: true to override
+    lot_size: 65            # NSE revision effective Jan-2026 series (was 75)
     exchange: "NSE"
-    expiry_day: "Thursday"  # Weekly expiry
+    # Fallback only. Expiry days are read from the broker's real expiry list
+    # (holiday-shifted and historically correct); this is used if that fails.
+    expiry_day: "Tuesday"   # Weekly expiry (moved from Thursday, Sep-2025)
     enabled: true
 
   BANKNIFTY:
     upstox_key: "NSE_INDEX|Nifty Bank"
     zerodha_symbol: "NIFTY BANK"
     atm_step: 100
-    lot_size: 15
+    lot_size: 30            # NSE revision effective Jan-2026 series (was 35)
     exchange: "NSE"
-    expiry_day: "Wednesday"
+    expiry_day: "Tuesday"   # Monthly only (last Tuesday); weekly discontinued Nov-2024
+    expiry_cycle: "monthly"
     enabled: true
 
   SENSEX:
     upstox_key: "BSE_INDEX|SENSEX"
     zerodha_symbol: "SENSEX"
     atm_step: 100
-    lot_size: 10
+    lot_size: 20            # BSE revision effective Jan-2025 (was 10)
     exchange: "BSE"
-    expiry_day: "Friday"
+    expiry_day: "Thursday"  # Weekly expiry
     enabled: true
     # ASSUMPTION: SENSEX volume is often zero in index feed — data_cleaner will handle this.
 
@@ -96,9 +99,12 @@ trading:
   no_trade_close_mins: 15      # No new trades after 15:15
   square_off_time: "15:15"     # Hard square-off for all paper/live positions
   skip_expiry_day: true        # Skip weekly expiry — theta/gamma extreme
-  event_blackout_mins: 30      # No trades 30 min before/after events below
+  skip_event_days: true        # No new trades on any date in event_calendar below
 
-# Calendar of known high-impact events (add new events here)
+# Calendar of known high-impact events (add new events here).
+# The whole day is skipped: the calendar has no announcement times, so a
+# minutes-around-the-event window could not be honoured. Verify dates against
+# the RBI / exchange announcements; these are not fetched automatically.
 # Format: YYYY-MM-DD: "Description"
 event_calendar:
   # 2025 events
@@ -107,18 +113,21 @@ event_calendar:
   "2026-02-05": "RBI MPC Policy"
   "2026-04-09": "RBI MPC Policy"
   "2026-06-09": "RBI MPC Policy"
-  "2026-01-01": "New Year Holiday"
 
-# ── Transaction Costs (Zerodha / Upstox rate card, June 2026) ──────────
+# ── Transaction Costs (options, rates as of Apr 2026) ──────────────────
+# Applied per leg on actual buy/sell turnover (src/costs.py). Backtests over
+# older dates use these current rates, which is conservative: STT was 0.10%
+# (Oct-2024 to Mar-2026) and 0.0625% before that.
 costs:
   brokerage_per_order: 20.0         # ₹20 flat per executed order
-  stt_sell_options_pct: 0.05        # STT 0.05% on sell-side premium (options)
-  exchange_txn_options_pct: 0.053   # NSE/BSE exchange transaction charge
-  gst_pct: 18.0                     # GST on (brokerage + exchange fees)
-  sebi_turnover_pct: 0.0001         # ₹10 per crore (≈ 0.0001%)
+  stt_sell_options_pct: 0.15        # STT on sell-side premium (Budget 2026, from 1-Apr-2026)
+  exchange_txn_options_pct:         # Exchange transaction charge on premium turnover
+    NSE: 0.03553
+    BSE: 0.0325
+  gst_pct: 18.0                     # GST on brokerage + exchange + SEBI fees
+  sebi_turnover_pct: 0.0001         # ₹10 per crore
   stamp_duty_buy_pct: 0.003         # 0.003% on buy premium
-  slippage_ticks: 1                 # 1-tick slippage each side (conservative)
-  # ASSUMPTION: tick size = ₹0.05 for options < ₹100, ₹0.10 for options ≥ ₹100
+  slippage_ticks: 1                 # ticks lost on entry and again on exit (tick = ₹0.05)
 
 # ── Paper Trading ──────────────────────────────────────────────────────
 paper_trading:
@@ -129,8 +138,9 @@ paper_trading:
   notify_on_signal: true       # Desktop notification via plyer
 
 # ── Live Trading ───────────────────────────────────────────────────────
-# SAFETY: live trading requires LIVE_TRADING=true in .env AND --live CLI flag
-# AND typed confirmation at startup. Never enable here.
+# SAFETY: live trading requires ALL of: LIVE_TRADING=true in .env, the --live
+# CLI flag, typed confirmation at startup, AND enabled: true below.
+# Leave enabled: false unless you have paper-traded for weeks.
 live_trading:
   enabled: false
   max_trades_per_day: 3

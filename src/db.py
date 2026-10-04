@@ -92,7 +92,7 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
             strategy        TEXT NOT NULL,
             entry_time      TEXT NOT NULL,
             exit_time       TEXT,
-            status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED | SQUARED_OFF
+            status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED | ABANDONED (process restarted)
             legs            TEXT NOT NULL,         -- JSON: entry prices per leg
             entry_total_premium REAL NOT NULL,
             exit_total_premium  REAL,
@@ -206,7 +206,9 @@ def save_signal(data: dict, db_path: str = DEFAULT_DB) -> int:
 
 
 def get_signals_today(db_path: str = DEFAULT_DB) -> pd.DataFrame:
-    today = datetime.now().strftime("%Y-%m-%d")
+    # signal_time is stored in IST, so "today" must be the IST date too.
+    from src.utils import today_ist
+    today = today_ist().strftime("%Y-%m-%d")
     with get_conn(db_path) as conn:
         rows = conn.execute(
             "SELECT * FROM signals WHERE signal_time LIKE ? ORDER BY signal_time DESC",
