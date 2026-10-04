@@ -238,4 +238,17 @@ elif page == "Backtest Results":
                                f"(real option data unavailable). Filter these for accurate stats.")
                 else:
                     st.success("All trades priced from real option data.")
-            st.dataframe(trades, use_container_width=True)
+            # Readable trade log: what was traded, when, at what net premium.
+            # Premiums are per unit; CREDIT = received on entry, DEBIT = paid.
+            view = trades.rename(columns={
+                "trade_date": "date", "premium_type": "type",
+                "entry_price": "entry_prem", "exit_price": "exit_prem",
+                "net_pnl_rs": "net_pnl_₹", "charges_rs": "costs_₹", "sl_tgt_tag": "exit",
+            })
+            cols = ["date", "entry_time", "exit_time", "signal", "strategy", "legs", "type",
+                    "entry_prem", "exit_prem", "lots", "lot_size", "costs_₹", "net_pnl_₹",
+                    "exit", "data_source"]
+            view = view[[c for c in cols if c in view.columns]]
+            st.caption("Premiums are net per unit across all legs. CREDIT = received on entry, "
+                       "DEBIT = paid. Legs: B = buy, S = sell.")
+            st.dataframe(view, use_container_width=True, hide_index=True)

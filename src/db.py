@@ -138,9 +138,18 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
             charges_rs      REAL,
             net_pnl_rs      REAL,
             sl_tgt_tag      TEXT,
-            data_source     TEXT                   -- "real_option_data" | "bs_approximation"
+            data_source     TEXT,                  -- "real_option_data" | "bs_approximation"
+            legs            TEXT,                  -- e.g. "S23750PE B23700PE"
+            premium_type    TEXT,                  -- CREDIT | DEBIT
+            entry_time      TEXT,                  -- HH:MM IST
+            exit_time       TEXT
         );
         """)
+        # Databases created before these columns existed: add them in place.
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(backtest_trades)")}
+        for col in ("legs", "premium_type", "entry_time", "exit_time"):
+            if col not in have:
+                conn.execute(f"ALTER TABLE backtest_trades ADD COLUMN {col} TEXT")
 
 
 # ── Forecast helpers ──────────────────────────────────────────────────

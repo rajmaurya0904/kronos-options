@@ -373,6 +373,7 @@ class Backtester:
                        for p in priced_legs)
 
         leg0 = legs[0]
+        entry_net, exit_net = net("entry"), net("exit")
         return {
             "trade_date":    exit_ts.strftime("%Y-%m-%d"),
             "entry_time":    open_trade["entry_ts"].strftime("%H:%M"),
@@ -384,8 +385,11 @@ class Backtester:
             "option_type":   leg0["option_type"],
             "legs":          " ".join(f"{l['action'][0]}{l['strike']}{l['option_type']}" for l in legs),
             "expiry":        exp,
-            "entry_price":   round(net("entry"), 2),
-            "exit_price":    round(net("exit"), 2),
+            # Net premium per unit, always positive; premium_type says whether
+            # it was paid (DEBIT) or received (CREDIT) on entry.
+            "premium_type":  "DEBIT" if entry_net >= 0 else "CREDIT",
+            "entry_price":   round(abs(entry_net), 2),
+            "exit_price":    round(abs(exit_net), 2),
             "lots":          lots,
             "lot_size":      priced_legs[0]["lot_size"],
             **result,
@@ -457,8 +461,9 @@ class Backtester:
                         """INSERT INTO backtest_trades
                            (run_id, trade_date, symbol, signal, strategy, strike, option_type,
                             expiry, entry_price, exit_price, lots, lot_size,
-                            raw_pnl_rs, charges_rs, net_pnl_rs, sl_tgt_tag, data_source)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            raw_pnl_rs, charges_rs, net_pnl_rs, sl_tgt_tag, data_source,
+                            legs, premium_type, entry_time, exit_time)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             run_id, row.get("trade_date"), symbol,
                             row.get("signal"), row.get("strategy"),
@@ -467,6 +472,8 @@ class Backtester:
                             _py(row.get("lots")), _py(row.get("lot_size")),
                             _py(row.get("raw_pnl_rs")), _py(row.get("charges_rs")), _py(row.get("net_pnl_rs")),
                             row.get("sl_tgt_tag"), row.get("data_source"),
+                            row.get("legs"), row.get("premium_type"),
+                            row.get("entry_time"), row.get("exit_time"),
                         ),
                     )
 
